@@ -43,9 +43,7 @@ _PREFIXES: tuple[tuple[str, ErrorType], ...] = (
 
 # MISSING_OBJECT rewinds to schema selection; SYNTAX rewinds to SQL generation.
 # The rest mean our own machinery refused or gave up, and retrying repeats it.
-_RETRYABLE: frozenset[ErrorType] = frozenset(
-    {ErrorType.MISSING_OBJECT, ErrorType.SYNTAX}
-)
+_RETRYABLE: frozenset[ErrorType] = frozenset({ErrorType.MISSING_OBJECT, ErrorType.SYNTAX})
 
 
 def classify_sql_error(error: Exception | str) -> ErrorType:

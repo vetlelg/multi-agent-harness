@@ -143,9 +143,7 @@ class AnthropicAdapter(LLMClient):
         )
 
     def complete(self, request: LLMRequest) -> LLMResult:
-        extras = {
-            k: v for k, v in request.extras.items() if k not in _ANTHROPIC_REJECTS
-        }
+        extras = {k: v for k, v in request.extras.items() if k not in _ANTHROPIC_REJECTS}
 
         start = time.perf_counter()
         response = self._client.messages.parse(
@@ -242,8 +240,7 @@ class OllamaAdapter(LLMClient):
             parsed = request.output_model.model_validate_json(raw_text)
         except ValidationError as exc:
             raise LLMUnparsable(
-                f"ollama/{self.model} output did not match "
-                f"{request.output_model.__name__}: {exc}"
+                f"ollama/{self.model} output did not match {request.output_model.__name__}: {exc}"
             ) from exc
 
         return LLMResult(
@@ -282,7 +279,5 @@ def get_client(spec: str) -> LLMClient:
 
     adapter = _ADAPTERS.get(provider)
     if adapter is None:
-        raise ValueError(
-            f"no adapter for provider {provider!r}; implemented: {sorted(_ADAPTERS)}"
-        )
+        raise ValueError(f"no adapter for provider {provider!r}; implemented: {sorted(_ADAPTERS)}")
     return adapter(model)

@@ -78,13 +78,11 @@ class Settings(BaseSettings):
         provider, separator, model = value.partition(":")
         if not separator or not model:
             raise ValueError(
-                f"expected 'provider:model', got {value!r}. "
-                f"Known providers: {sorted(PROVIDERS)}"
+                f"expected 'provider:model', got {value!r}. Known providers: {sorted(PROVIDERS)}"
             )
         if provider not in PROVIDERS:
             raise ValueError(
-                f"unknown provider {provider!r} in {value!r}. "
-                f"Known providers: {sorted(PROVIDERS)}"
+                f"unknown provider {provider!r} in {value!r}. Known providers: {sorted(PROVIDERS)}"
             )
         return value
 

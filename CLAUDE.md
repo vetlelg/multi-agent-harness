@@ -1,8 +1,24 @@
-# SQL Agent — monorepo, two orchestrators
+# Agent harness — monorepo, two orchestrators
 
-## What to build
+## Purpose
 
-A multi-agent system that answers natural-language questions about a real database by
+  This repo is a **multi-agent harness** — a reusable infrastructure for building,
+  deploying, and observing multi-agent LLM systems. The SQL agent (Chinook) is the
+  first instance, not the identity of the project.
+
+  The layers that transfer to any use case: two competing orchestrators (hand-built
+  and LangGraph), the provider-agnostic LLM wrapper, typed event log, retry routing,
+  the `/ask` contract pattern, Docker/k8s infra, OTel + Grafana observability, and
+  Promptfoo evaluation.
+
+  What changes per use case: agents, prompts, output schemas, guard logic, and the
+  backing data store. The goal is that spinning up a new agent system means writing
+  the domain-specific agents and prompts, not re-building orchestration, infra, or
+  observability.
+
+## What to build - SQL Agent
+
+**First instance: SQL agent.**: A multi-agent system that answers natural-language questions about a real database by
 generating and executing SQL — implemented twice in one repo. Two LLM agents and a
 deterministic executor are shared; only the orchestration layer differs:
 
@@ -45,6 +61,15 @@ dialect drift between dev and cluster).
 - API key: `.env` locally (gitignored); a Kubernetes Secret in-cluster — never in
   images or manifests
 - `pytest`, `ruff`
+- `structlog` for structured logging with context propagation (run_id bound
+  once, flows through all calls) — replaces raw `print(json)` in `core/events`
+- OpenTelemetry (`opentelemetry-instrumentation-fastapi`,
+  `opentelemetry-instrumentation-httpx`) for distributed tracing and metrics;
+  exports to the Grafana stack
+- Grafana stack in-cluster: Tempo (traces), Prometheus (metrics), Loki (logs),
+  Grafana (dashboards)
+- `promptfoo` for offline prompt evaluation — scores answer quality across the
+  question set when prompts change
 
 ## Shared services (`agents/`)
 
@@ -129,16 +154,22 @@ infra/                  # k8s manifests, kustomization, Makefile targets
 5. Error-retry verified end-to-end: force a failing query, confirm from the logs
    which path handled it (schema re-selection vs. query regeneration) and that the
    run recovered.
-6. `orchestrator_lg` runs locally against the same shared services; single-table
+6. Observability: OTel auto-instrumentation on every FastAPI service and HTTP
+     client, Grafana stack deployed in-cluster (Tempo, Prometheus, Loki, Grafana),
+     structlog replacing raw JSON prints. A cross-service trace for a full
+     question run visible in Grafana.
+7. `orchestrator_lg` runs locally against the same shared services; single-table
    question works end-to-end.
-7. LangGraph orchestrator deployed alongside the scratch one. Resume verified: kill
+8. LangGraph orchestrator deployed alongside the scratch one. Resume verified: kill
    the pod mid-run, rerun with the same `thread_id`, confirm it continues from the
    checkpoint (works because the checkpointer is on the PVC).
-8. 20-question test set with expected answers in `tests/questions.yaml`; `pytest`
+9. 20-question test set with expected answers in `tests/questions.yaml`; `pytest`
    runs it against BOTH in-cluster orchestrators via the shared `/ask` contract.
+10. Prompt evaluation with `promptfoo`: config wired to the question set,
+    LLM-as-judge scoring, baseline snapshot saved. A prompt change produces a
+    diff report showing regressions and improvements.
 
 ## Deliberately deferred (do not build yet)
 
 Event sourcing (`orchestrator_scratch/` will later be refactored into an
-event-sourced `orchestrator_es/`), observer agent, evaluation/experiments harness,
-web UI.
+event-sourced `orchestrator_es/`), observer agent, web UI.

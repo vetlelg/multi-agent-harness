@@ -18,7 +18,7 @@ replayable.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
@@ -32,11 +32,7 @@ SCHEMA_VERSION = 1
 
 def _utc_now() -> str:
     """UTC, millisecond precision, ``Z`` suffix."""
-    return (
-        datetime.now(timezone.utc)
-        .isoformat(timespec="milliseconds")
-        .replace("+00:00", "Z")
-    )
+    return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def new_run_id() -> str:

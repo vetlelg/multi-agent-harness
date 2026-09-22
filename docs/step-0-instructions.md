@@ -5,7 +5,7 @@ Exact actions only. For the reasoning behind any of it, see `step-0-explained.md
 **Convention:** file sections give you names, signatures, fields and required behaviour.
 They are specifications, not source. You write the bodies.
 
-**State of play:** 0.1–0.5 are done. Start at 0.6.
+**State of play:** 0.1–0.11 are done. Step 0 is complete.
 
 ---
 
@@ -51,7 +51,7 @@ python -c "import sqlite3;print(sqlite3.connect('file:data/chinook.db?mode=ro',u
 
 ---
 
-## 0.6 Provider-agnostic LLM wrapper
+## 0.6 Provider-agnostic LLM wrapper — DONE
 
 ### 0.6.1 Add dependencies
 
@@ -212,7 +212,7 @@ It must assert: a validated instance is returned, `stop_reason == FINISHED`, and
 
 ---
 
-## 0.7 `core/config.py`
+## 0.7 `core/config.py` — DONE
 
 Exports:
 
@@ -260,7 +260,7 @@ Verify — `tests/test_config.py`:
 
 ---
 
-## 0.8 `core/models.py`
+## 0.8 `core/models.py` — DONE
 
 All models set `model_config = ConfigDict(extra="forbid")`.
 
@@ -321,7 +321,7 @@ model a misspelled field name and expect a validation error.
 
 ---
 
-## 0.9 `core/errors.py`
+## 0.9 `core/errors.py` — DONE
 
 Exports:
 
@@ -359,7 +359,7 @@ Verify — `tests/test_errors.py`, parametrised over all nine strings above.
 
 ---
 
-## 0.10 `core/events.py`
+## 0.10 `core/events.py` — DONE
 
 Exports:
 
@@ -412,7 +412,7 @@ file back, and validate each line into the correct event class.
 
 ---
 
-## 0.11 Prompts, lint, tests
+## 0.11 Prompts, lint, tests — DONE
 
 ### Prompt files
 
