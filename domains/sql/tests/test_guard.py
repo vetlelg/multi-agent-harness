@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from agents.executor.guard import validate_and_rewrite
-from core.errors import GuardRejection
+from domains.sql.errors import GuardRejection
+from domains.sql.tools.executor.guard import validate_and_rewrite
 
 
 @pytest.mark.parametrize(

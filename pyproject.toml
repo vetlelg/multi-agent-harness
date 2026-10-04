@@ -1,3 +1,8 @@
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+
+[tool.pytest.ini_options]
+# Harness tests live in tests/; each domain's tests live in domains/<name>/tests/.
+testpaths = ["tests", "domains"]
+pythonpath = ["."]

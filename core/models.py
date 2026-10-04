@@ -1,191 +1,110 @@
-"""Every message that crosses a process boundary, plus the shared run state.
+"""The public contract every domain and both orchestrators share.
 
-These shapes are the contract that makes the two orchestrators interchangeable.
-Written as models, a mismatch is a validation error at the boundary it happened
-on. Written as dicts, a mismatch is a ``None`` that travels two hops before
-failing somewhere unrelated -- hence ``extra="forbid"`` on everything.
+These shapes are what make domains and orchestrators interchangeable behind one
+CLI and one test runner. Written as models, a mismatch is a validation error at
+the boundary it happened on. Written as dicts, a mismatch is a ``None`` that
+travels two hops before failing somewhere unrelated -- hence ``extra="forbid"``
+on everything.
 
-This module imports only ``core.errors``.
+Domain-specific messages live in ``domains/<name>/models.py`` and build on
+:class:`Strict` and :class:`AgentRequest`.
+
+This module imports nothing of ours.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
-
-from core.errors import ErrorType
 
 #: Rows are returned positionally, paired with ``columns``.
 Row = list[Any]
 
 
-class _Strict(BaseModel):
+class Strict(BaseModel):
     """Base for every contract model: unknown fields are an error, not a shrug."""
 
     model_config = ConfigDict(extra="forbid")
 
 
-# --------------------------------------------------------------------------- #
-# Database introspection                                                        #
-# --------------------------------------------------------------------------- #
+class AgentRequest(Strict):
+    """Base for every request between services.
 
+    Inheriting from it is what puts the ``run_id`` on every inter-service call
+    by construction rather than by remembering to.
+    """
 
-class ColumnInfo(_Strict):
-    name: str
-    type: str
-    nullable: bool
-    pk: bool
-
-
-class ForeignKeyInfo(_Strict):
-    column: str
-    references_table: str
-    references_column: str
-
-
-class TableInfo(_Strict):
-    name: str
-    columns: list[ColumnInfo]
-    foreign_keys: list[ForeignKeyInfo] = Field(default_factory=list)
-
-
-class SchemaResponse(_Strict):
-    """Body of ``GET /schema`` on the executor."""
-
-    tables: list[TableInfo]
+    run_id: str
 
 
 # --------------------------------------------------------------------------- #
-# Public contract: POST /ask, identical on both orchestrators                    #
+# Evidence: what an answer rests on                                             #
+# --------------------------------------------------------------------------- #
+# Kinds are presentation types, not domain types -- a tabular query result looks
+# the same whether the query was SQL or PromQL. A new domain picks from these;
+# a genuinely new kind is a harness change, made once for every domain.
+
+
+class QueryEvidence(Strict):
+    """A query that was run and the table it returned."""
+
+    kind: Literal["query"] = "query"
+    #: e.g. "sql", "promql".
+    language: str
+    query: str
+    columns: list[str] | None = None
+    rows: list[Row] | None = None
+    #: True when a row limit cut the result short.
+    truncated: bool = False
+
+
+class CitationEvidence(Strict):
+    """A passage the answer quotes or relies on."""
+
+    kind: Literal["citation"] = "citation"
+    source: str
+    #: Where in the source: a section, page or line range.
+    locator: str | None = None
+    excerpt: str
+
+
+class ToolEvidence(Strict):
+    """A tool call the agent made and what came back."""
+
+    kind: Literal["tool"] = "tool"
+    tool: str
+    input: dict[str, Any]
+    output: str
+    ok: bool
+
+
+Evidence = Annotated[
+    QueryEvidence | CitationEvidence | ToolEvidence,
+    Field(discriminator="kind"),
+]
+
+
+# --------------------------------------------------------------------------- #
+# Public contract: POST /ask, identical on every domain and both orchestrators   #
 # --------------------------------------------------------------------------- #
 
 
-class AskRequest(_Strict):
+class AskRequest(Strict):
     question: str
     #: Supply to resume a LangGraph run; it is also the checkpointer thread_id.
     #: Omitted means the orchestrator generates one.
     run_id: str | None = None
 
 
-class AskResponse(_Strict):
+class AskResponse(Strict):
     run_id: str
+    domain: str
     orchestrator: str
     question: str
-    sql: str | None
-    columns: list[str] | None
-    rows: list[Row] | None
     answer: str
+    evidence: list[Evidence]
     attempts: int
     #: Set when the run finished without producing data. Still HTTP 200 -- "could
     #: not answer" and "the service is broken" are different events.
     error: str | None
-
-
-# --------------------------------------------------------------------------- #
-# Internal calls                                                                #
-# --------------------------------------------------------------------------- #
-
-
-class SelectSchemaRequest(_Strict):
-    run_id: str
-    question: str
-    previous_sql: str | None = None
-    error: str | None = None
-
-
-class SelectSchemaResponse(_Strict):
-    tables: list[TableInfo]
-    #: Rendered once, here, and passed onward verbatim, so that the text the
-    #: model sees is identical across both orchestrators and reproducible from
-    #: the run log.
-    schema_text: str
-
-
-class GenerateSqlRequest(_Strict):
-    run_id: str
-    question: str
-    schema_text: str
-    previous_sql: str | None = None
-    error: str | None = None
-    attempt: int
-
-
-class GenerateSqlResponse(_Strict):
-    sql: str
-
-
-class ExecuteRequest(_Strict):
-    run_id: str
-    sql: str
-
-
-class ExecuteResponse(_Strict):
-    ok: bool
-    #: The SQL actually run, after the guard rewrote it (e.g. added a LIMIT).
-    sql_executed: str | None = None
-    columns: list[str] | None = None
-    rows: list[Row] | None = None
-    row_count: int | None = None
-    truncated: bool = False
-    elapsed_ms: int
-    #: Drives retry routing. Classified by the executor so both orchestrators
-    #: branch on the same value.
-    error_type: ErrorType | None = None
-    error: str | None = None
-
-
-# --------------------------------------------------------------------------- #
-# Model output schemas                                                          #
-# --------------------------------------------------------------------------- #
-# Handed to LLMRequest.output_model. Keep these flat: optionals, unions and deep
-# nesting are exactly where the four providers' schema support diverges.
-
-
-class SqlOut(_Strict):
-    sql: str
-
-
-class SelectedTableOut(_Strict):
-    name: str
-    columns: list[str]
-
-
-class SelectedSchemaOut(_Strict):
-    """What the schema agent's model call returns: names only.
-
-    Types, nullability and foreign keys are looked up from the real introspected
-    schema rather than re-emitted by the model, so they cannot be hallucinated.
-    """
-
-    tables: list[SelectedTableOut]
-
-
-class AnswerOut(_Strict):
-    answer: str
-
-
-# --------------------------------------------------------------------------- #
-# Shared run state                                                              #
-# --------------------------------------------------------------------------- #
-
-
-class RunState(_Strict):
-    """State of one run.
-
-    Used by the hand-built loop and, in Step 6, directly as the LangGraph state
-    schema -- which is what turns "both orchestrators behave the same" from an
-    assertion into a type.
-    """
-
-    run_id: str
-    question: str
-    schema_text: str | None = None
-    sql: str | None = None
-    columns: list[str] | None = None
-    rows: list[Row] | None = None
-    error: str | None = None
-    error_type: ErrorType | None = None
-    #: Executions performed so far. Retry while ``attempts < settings.max_attempts``.
-    attempts: int = 0
-    answer: str | None = None

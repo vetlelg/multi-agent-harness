@@ -1,15 +1,11 @@
 from __future__ import annotations
 
-import time
-from pathlib import Path
-
-import httpx
-from fastapi import FastAPI
-
-from core.config import settings
-from core.events import HttpCall, ModelCall, emit
-from core.llm import LLMRequest, get_client
-from core.models import (
+from core import http, llm
+from core.events import RunContext
+from core.prompts import load_prompt
+from core.service import create_app
+from domains.sql.config import PROMPTS, settings
+from domains.sql.models import (
     SchemaResponse,
     SelectedSchemaOut,
     SelectSchemaRequest,
@@ -17,12 +13,10 @@ from core.models import (
     TableInfo,
 )
 
-app = FastAPI()
+SERVICE = "schema_agent"
+app = create_app(SERVICE)
 
-_SYSTEM_PROMPT = (
-    Path(__file__).resolve().parents[2] / "core" / "prompts" / "schema_select.txt"
-).read_text()
-_http = httpx.Client(timeout=settings.http_timeout_s)
+_SYSTEM_PROMPT = load_prompt(PROMPTS / "schema_select.txt")
 
 
 def _render_schema(tables: list[TableInfo]) -> str:
@@ -44,32 +38,17 @@ def _render_schema(tables: list[TableInfo]) -> str:
     return "\n\n".join(parts)
 
 
-@app.get("/healthz")
-def healthz() -> dict:
-    return {"status": "ok"}
-
-
 @app.post("/select-schema")
 def select_schema(request: SelectSchemaRequest) -> SelectSchemaResponse:
-    start = time.perf_counter()
-    resp = _http.get(f"{settings.executor_url}/schema")
-    resp.raise_for_status()
-    elapsed_ms = int((time.perf_counter() - start) * 1000)
+    ctx = RunContext(run_id=request.run_id, service=SERVICE)
 
-    full_schema = SchemaResponse.model_validate(resp.json())
-
-    emit(
-        HttpCall(
-            run_id=request.run_id,
-            service="schema_agent",
-            target="executor",
-            method="GET",
-            path="/schema",
-            status=resp.status_code,
-            elapsed_ms=elapsed_ms,
-        )
+    full_schema = http.get(
+        ctx,
+        target="executor",
+        base_url=settings.executor_url,
+        path="/schema",
+        response_model=SchemaResponse,
     )
-
     full_text = _render_schema(full_schema.tables)
 
     user_parts = [f"## Full Database Schema\n{full_text}", f"## Question\n{request.question}"]
@@ -78,29 +57,13 @@ def select_schema(request: SelectSchemaRequest) -> SelectSchemaResponse:
     if request.error:
         user_parts.append(f"## Error\n{request.error}")
 
-    client = get_client(settings.schema_model)
-    llm_req = LLMRequest(
-        system=_SYSTEM_PROMPT, user="\n\n".join(user_parts), output_model=SelectedSchemaOut
-    )
-
-    start = time.perf_counter()
-    result = client.complete(llm_req)
-    llm_elapsed = int((time.perf_counter() - start) * 1000)
-
-    emit(
-        ModelCall(
-            run_id=request.run_id,
-            service="schema_agent",
-            role="schema",
-            provider=result.provider,
-            model=result.model,
-            prompt=llm_req.user,
-            response=result.raw_text,
-            input_tokens=result.input_tokens,
-            output_tokens=result.output_tokens,
-            stop_reason=result.stop_reason.value,
-            elapsed_ms=llm_elapsed,
-        )
+    result = llm.call_model(
+        ctx,
+        role="schema",
+        model=settings.schema_model,
+        system=_SYSTEM_PROMPT,
+        user="\n\n".join(user_parts),
+        output_model=SelectedSchemaOut,
     )
 
     table_lookup = {t.name: t for t in full_schema.tables}

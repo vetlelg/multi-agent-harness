@@ -1,8 +1,8 @@
 """SQL error classification.
 
-The single authority on what kind of failure a SQL error is. Both orchestrators
-import ``classify_sql_error`` to decide where a retry goes, which is what stops
-their retry routing from drifting apart.
+The single authority on what kind of failure a SQL error is. The executor
+classifies at the source and the pipeline's route branches on the result, so
+both orchestrators route retries from the same value.
 
 Every prefix below was produced by running a failing query against the real
 Chinook database. Do not add a prefix you have not observed.

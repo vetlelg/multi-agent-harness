@@ -4,13 +4,11 @@ import sqlite3
 import time
 from contextlib import contextmanager
 
-from fastapi import FastAPI
-
-from agents.executor.guard import make_authorizer, validate_and_rewrite
-from core.config import settings
-from core.errors import ErrorType, GuardRejection, classify_sql_error
-from core.events import SqlExecute, emit
-from core.models import (
+from core.events import ToolCall, emit
+from core.service import create_app
+from domains.sql.config import settings
+from domains.sql.errors import ErrorType, GuardRejection, classify_sql_error
+from domains.sql.models import (
     ColumnInfo,
     ExecuteRequest,
     ExecuteResponse,
@@ -18,8 +16,10 @@ from core.models import (
     SchemaResponse,
     TableInfo,
 )
+from domains.sql.tools.executor.guard import make_authorizer, validate_and_rewrite
 
-app = FastAPI()
+SERVICE = "executor"
+app = create_app(SERVICE)
 
 _db_uri = f"file:{settings.db_path}?mode=ro"
 
@@ -70,11 +70,6 @@ def _introspect() -> SchemaResponse:
 _cached_schema: SchemaResponse | None = None
 
 
-@app.get("/healthz")
-def healthz() -> dict:
-    return {"status": "ok"}
-
-
 @app.get("/schema")
 def schema() -> SchemaResponse:
     global _cached_schema
@@ -97,6 +92,31 @@ def _timeout_guard(timeout_s: float):
         _exec_conn.set_progress_handler(None, 0)
 
 
+def _emit(request: ExecuteRequest, response: ExecuteResponse) -> ExecuteResponse:
+    emit(
+        ToolCall(
+            run_id=request.run_id,
+            service=SERVICE,
+            tool="sql.execute",
+            input={"sql": request.sql, "sql_executed": response.sql_executed},
+            ok=response.ok,
+            output=(
+                {
+                    "columns": response.columns,
+                    "rows": response.rows,
+                    "row_count": response.row_count,
+                }
+                if response.ok
+                else None
+            ),
+            error_type=response.error_type,
+            error=response.error,
+            elapsed_ms=response.elapsed_ms,
+        )
+    )
+    return response
+
+
 @app.post("/execute")
 def execute(request: ExecuteRequest) -> ExecuteResponse:
     start = time.perf_counter()
@@ -104,25 +124,16 @@ def execute(request: ExecuteRequest) -> ExecuteResponse:
     try:
         rewritten = validate_and_rewrite(request.sql)
     except GuardRejection as e:
-        resp = ExecuteResponse(
-            ok=False,
-            error_type=ErrorType.GUARD_REJECTED,
-            error=str(e),
-            elapsed_ms=0,
-            sql_executed=None,
-        )
-        emit(
-            SqlExecute(
-                run_id=request.run_id,
-                service="executor",
-                sql=request.sql,
+        return _emit(
+            request,
+            ExecuteResponse(
                 ok=False,
                 error_type=ErrorType.GUARD_REJECTED,
                 error=str(e),
                 elapsed_ms=0,
-            )
+                sql_executed=None,
+            ),
         )
-        return resp
 
     try:
         with _timeout_guard(settings.query_timeout_s):
@@ -135,47 +146,27 @@ def execute(request: ExecuteRequest) -> ExecuteResponse:
                 columns = []
                 rows = []
     except sqlite3.DatabaseError as e:
-        elapsed_ms = int((time.perf_counter() - start) * 1000)
-        error_type = classify_sql_error(e)
-        resp = ExecuteResponse(
-            ok=False,
-            error_type=error_type,
-            error=str(e),
-            elapsed_ms=elapsed_ms,
-            sql_executed=rewritten,
-        )
-        emit(
-            SqlExecute(
-                run_id=request.run_id,
-                service="executor",
-                sql=rewritten,
+        return _emit(
+            request,
+            ExecuteResponse(
                 ok=False,
-                error_type=error_type,
+                error_type=classify_sql_error(e),
                 error=str(e),
-                elapsed_ms=elapsed_ms,
-            )
+                elapsed_ms=int((time.perf_counter() - start) * 1000),
+                sql_executed=rewritten,
+            ),
         )
-        return resp
 
-    elapsed_ms = int((time.perf_counter() - start) * 1000)
     row_count = len(rows)
-    resp = ExecuteResponse(
-        ok=True,
-        sql_executed=rewritten,
-        columns=columns,
-        rows=rows,
-        row_count=row_count,
-        truncated=row_count == settings.row_limit,
-        elapsed_ms=elapsed_ms,
-    )
-    emit(
-        SqlExecute(
-            run_id=request.run_id,
-            service="executor",
-            sql=rewritten,
+    return _emit(
+        request,
+        ExecuteResponse(
             ok=True,
+            sql_executed=rewritten,
+            columns=columns,
+            rows=rows,
             row_count=row_count,
-            elapsed_ms=elapsed_ms,
-        )
+            truncated=row_count == settings.row_limit,
+            elapsed_ms=int((time.perf_counter() - start) * 1000),
+        ),
     )
-    return resp

@@ -3,17 +3,18 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-from core.errors import ErrorType
 from core.events import (
+    Event,
     HttpCall,
     ModelCall,
     RouteDecision,
     RunEnd,
     RunStart,
-    SqlExecute,
+    ToolCall,
     emit,
     new_run_id,
     parse_event,
+    sequenced,
 )
 
 
@@ -24,7 +25,14 @@ def test_emit_and_parse_all_event_types(monkeypatch) -> None:
 
         rid = new_run_id()
         events = [
-            RunStart(run_id=rid, service="test", question="Q?", orchestrator="scratch", seq=1),
+            RunStart(
+                run_id=rid,
+                service="test",
+                question="Q?",
+                domain="sql",
+                orchestrator="scratch",
+                seq=1,
+            ),
             HttpCall(
                 run_id=rid,
                 service="test",
@@ -38,23 +46,28 @@ def test_emit_and_parse_all_event_types(monkeypatch) -> None:
             ModelCall(
                 run_id=rid,
                 service="test",
-                role="sql",
+                role="query",
                 provider="anthropic",
                 model="claude-opus-5",
+                prompt_id="domains/sql/prompts/generate_sql.txt",
+                prompt_sha="0123456789ab",
+                system="You write SQL.",
                 prompt="generate sql",
                 response="SELECT 1",
+                params={"max_tokens": 16000},
                 input_tokens=10,
                 output_tokens=5,
                 stop_reason="finished",
                 elapsed_ms=100,
                 seq=3,
             ),
-            SqlExecute(
+            ToolCall(
                 run_id=rid,
                 service="test",
-                sql="SELECT 1",
+                tool="sql.execute",
+                input={"sql": "SELECT 1"},
                 ok=True,
-                row_count=1,
+                output={"columns": ["1"], "rows": [[1]], "row_count": 1},
                 elapsed_ms=3,
                 seq=4,
             ),
@@ -62,7 +75,7 @@ def test_emit_and_parse_all_event_types(monkeypatch) -> None:
                 run_id=rid,
                 service="test",
                 attempt=1,
-                error_type=ErrorType.SYNTAX,
+                error_type="syntax",
                 branch="generate_sql",
                 seq=5,
             ),
@@ -88,5 +101,26 @@ def test_emit_and_parse_all_event_types(monkeypatch) -> None:
         for line, original in zip(lines, events):
             parsed = parse_event(line)
             assert type(parsed) is type(original)
-            assert parsed.run_id == rid
-            assert parsed.type == original.type
+            assert parsed == original
+
+
+def test_sequenced_numbers_from_one_without_mutating() -> None:
+    seen: list[Event] = []
+    emit_seq = sequenced(seen.append)
+    originals = [
+        RunEnd(run_id="r", service="s", attempts=0, ok=True),
+        RunEnd(run_id="r", service="s", attempts=1, ok=True),
+    ]
+    for event in originals:
+        emit_seq(event)
+
+    assert [e.seq for e in seen] == [1, 2]
+    assert all(e.seq is None for e in originals)
+
+
+def test_each_sequence_is_independent() -> None:
+    first: list[Event] = []
+    second: list[Event] = []
+    sequenced(first.append)(RunEnd(run_id="a", service="s", attempts=0, ok=True))
+    sequenced(second.append)(RunEnd(run_id="b", service="s", attempts=0, ok=True))
+    assert first[0].seq == second[0].seq == 1

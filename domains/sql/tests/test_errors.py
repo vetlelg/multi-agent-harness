@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from core.errors import ErrorType, GuardRejection, classify_sql_error, is_retryable
+from domains.sql.errors import ErrorType, GuardRejection, classify_sql_error, is_retryable
 
 
 @pytest.mark.parametrize(

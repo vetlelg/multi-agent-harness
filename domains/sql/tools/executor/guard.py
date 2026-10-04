@@ -4,8 +4,8 @@ import re
 import sqlite3
 from collections.abc import Callable
 
-from core.config import settings
-from core.errors import GuardRejection
+from domains.sql.config import settings
+from domains.sql.errors import GuardRejection
 
 _FORBIDDEN = re.compile(
     r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|ATTACH|PRAGMA)\b",
