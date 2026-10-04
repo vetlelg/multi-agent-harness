@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 
 import pytest
 from fastapi.testclient import TestClient
@@ -62,3 +63,37 @@ def test_executor_guard_rejects_writes(executor, capsys) -> None:
 def test_executor_classifies_missing_table(executor) -> None:
     body = executor.post("/execute", json={"run_id": "r1", "sql": "SELECT * FROM Nope"}).json()
     assert body["error_type"] == "missing_object"
+
+
+#: About five seconds unbounded, so only the timeout ends it quickly -- and if the
+#: timeout is ever lost, the query still finishes and the test fails, not hangs.
+_LONG_QUERY = (
+    "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 30000000) "
+    "SELECT COUNT(*) FROM c"
+)
+
+
+@needs_db
+def test_executor_times_out_long_queries(executor, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "query_timeout_s", 0.3)
+    body = executor.post("/execute", json={"run_id": "r1", "sql": _LONG_QUERY}).json()
+
+    assert body["ok"] is False
+    assert body["error_type"] == "timeout"
+
+
+@needs_db
+def test_one_request_finishing_does_not_disarm_another() -> None:
+    """Each query's timeout belongs to that query.
+
+    With one shared connection the progress handler was shared too: a request
+    finishing cleared it while another request's query was still to run, and that
+    query ran unbounded. This replays the interleaving in a single thread.
+    """
+    from domains.sql.tools.executor.app import _query_connection
+
+    with _query_connection(timeout_s=0.3) as slow:
+        with _query_connection(timeout_s=0.3) as fast:
+            fast.execute("SELECT 1").fetchall()
+        with pytest.raises(sqlite3.OperationalError, match="interrupted"):
+            slow.execute(_LONG_QUERY).fetchall()

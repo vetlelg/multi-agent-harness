@@ -7,6 +7,7 @@ import sys
 import httpx
 
 from core.config import settings
+from core.events import new_run_id
 from core.models import (
     AskRequest,
     AskResponse,
@@ -41,12 +42,21 @@ def main() -> None:
         help="Which domain to ask (default: the DOMAIN setting).",
     )
     parser.add_argument("--target", required=True, choices=_TARGETS, help="Which orchestrator.")
+    parser.add_argument(
+        "--run-id",
+        help="Resume this run, or fetch its result if it finished (default: a new run).",
+    )
     parser.add_argument("question", help="Natural-language question.")
     args = parser.parse_args()
 
     domain_settings = load_domain_settings(args.domain)
     url = domain_settings.scratch_url if args.target == "scratch" else domain_settings.lg_url
-    body = AskRequest(question=args.question)
+
+    # Chosen here and printed before the request, so a run whose connection drops
+    # can still be resumed with --run-id.
+    run_id = args.run_id or new_run_id()
+    print(f"run_id: {run_id}", file=sys.stderr)
+    body = AskRequest(question=args.question, run_id=run_id)
 
     resp = httpx.post(f"{url}/ask", json=body.model_dump(), timeout=settings.llm_timeout_s * 4)
     resp.raise_for_status()

@@ -1,0 +1,17 @@
+# Secrets: never in a build context, never in an image.
+.env
+
+# Local machinery and artefacts.
+.git
+.venv
+runs/
+checkpoints/
+**/__pycache__
+**/*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Not needed at runtime.
+**/tests
+**/evals
+docs/

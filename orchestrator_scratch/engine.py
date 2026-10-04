@@ -31,7 +31,9 @@ SERVICE = "orchestrator_scratch"
 
 def run(domain: Domain, request: AskRequest, *, emitter: Emitter = emit) -> AskResponse:
     run_id = request.run_id or new_run_id()
-    ctx = RunContext(run_id=run_id, service=SERVICE, emit=sequenced(emitter))
+    # Scratch keeps no record of runs, so every call is a new run: segment 1, even
+    # for a supplied run_id (CLAUDE.md, "Run identity and resume").
+    ctx = RunContext(run_id=run_id, service=SERVICE, emit=sequenced(emitter, segment=1))
     pipeline = domain.pipeline
     state = pipeline.state(run_id=run_id, question=request.question)
 

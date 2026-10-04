@@ -51,6 +51,8 @@ def test_events_are_bracketed_and_numbered(monkeypatch) -> None:
     assert isinstance(events[-1], RunEnd)
     assert events[-1].ok is True
     assert [e.seq for e in events] == list(range(1, len(events) + 1))
+    # Scratch keeps no record of runs, so every call is a new run: segment 1.
+    assert {e.segment for e in events} == {1}
     assert {e.run_id for e in events} == {response.run_id}
 
 

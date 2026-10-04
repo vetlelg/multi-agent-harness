@@ -5,8 +5,8 @@
 This repo is a **multi-agent harness**: reusable infrastructure for building, deploying,
 and observing multi-agent LLM systems. Each use case is a **domain** — a self-contained
 package under `domains/<name>/`. The SQL agent (`domains/sql/`, Chinook) is the first
-domain, not the identity of the project. Planned next: a documentation agent and a
-troubleshooting/ops agent.
+domain, not the identity of the project. Further domains (documentation,
+troubleshooting/ops) are deliberately deferred; see the end of this file.
 
 The harness supplies everything that transfers between use cases: two competing
 orchestration engines (hand-built and LangGraph), the provider-agnostic LLM wrapper with
@@ -69,7 +69,7 @@ domain means writing domain code, never editing the harness.**
 |---|---|
 | `config.py` | `Settings` (harness), `DomainSettings` base, `ModelSpec` (`provider:model`) |
 | `models.py` | `Strict` base, `AgentRequest` (carries `run_id`), `/ask` contract, evidence kinds |
-| `events.py` | Typed event log, `emit`, `RunContext`, `sequenced` emitter |
+| `events.py` | Typed event log, `emit`, `RunContext`, `sequenced` emitter (stamps `segment` + `seq`) |
 | `llm.py` | Provider adapters: structured output (`complete`), tool-use turns (`chat`); `call_model` emits `ModelCall` |
 | `agent_loop.py` | Hand-built tool loop for agentic domains: `Tool`, `ToolFailed`, `run_tool_loop` |
 | `pipeline.py` | `RunState` base, `Pipeline`, `Route`, `Domain`, `END`, `apply_update` |
@@ -90,10 +90,11 @@ domains/<name>/
   domain.py        # steps, routes, evidence(); exports DOMAIN = Domain(...)
   prompts/         # its prompt files
   agents/<agent>/  # LLM services (FastAPI via create_app)
-  tools/<tool>/    # deterministic tool servers + guards
+  tools/<tool>/    # deterministic tool servers + guards (+ a Dockerfile when the tool needs
+                   #   more than Python packages; the sql executor bakes in its database)
   tests/           # its unit tests (collected by the root pytest run)
   evals/           # questions + expected answers, promptfoo config
-infra/overlays/<name>/  # its deployment
+infra/overlays/<name>/  # its deployment: compose.yaml now, kustomize from milestone 4
 ```
 
 **Adding a domain — acceptance criterion:** outside `domains/<name>/` and
@@ -105,9 +106,9 @@ had to change, the harness is missing an abstraction — fix the harness, not th
 - **Workflow** — fixed steps with conditional routes (the SQL domain: schema → query →
   execute, routed retries).
 - **Agentic** — a step calls `core.agent_loop.run_tool_loop`: the model chooses tool calls
-  until it answers (the planned ops domain). Tool failures the model should see raise
-  `ToolFailed` and go back to it as error results; anything else is a bug and fails the
-  run. Checkpoint granularity is the step: if per-turn checkpoints are needed, split model
+  until it answers (no domain uses it yet; the deferred ops domain would). Tool failures
+  the model should see raise `ToolFailed` and go back to it as error results; anything
+  else is a bug and fails the run. Checkpoint granularity is the step: if per-turn checkpoints are needed, split model
   and tool turns into separate steps with a route between them.
 
 ## Engines
@@ -122,9 +123,36 @@ pin them for scratch):
 - After a step with a route, the route decides the next step and a `RouteDecision` event
   is emitted. A route returning a target it did not declare is an error.
 - `RunStart` first, `RunEnd` last — `RunEnd` is emitted even when a step raises. The
-  orchestrator numbers its own events (`seq`) and owns the ordered log of record.
+  orchestrator numbers its own events and owns the ordered log of record:
+  `sequenced(emitter, segment=n)` stamps `segment` and `seq` (from 1), and a run's log is
+  ordered by `(segment, seq)`.
 - `max_steps` (domain settings) bounds the run; exceeding it is an error.
 - The pipeline must end with `state.answer` set.
+
+### Run identity and resume (both engines)
+
+- A `run_id` names one run. Clients may supply it, and the CLI always does: it generates
+  one unless `--run-id` is given, and prints it to stderr before sending, so a run whose
+  connection dropped can be resumed.
+- What an engine does with the `run_id` of a request:
+
+  | The engine has … | It … |
+  |---|---|
+  | no record of it | starts a new run: segment 1 |
+  | an unfinished run (a checkpoint with steps pending) | resumes it as the next segment, from the last checkpoint, with no new input. A different `question` is a 409. |
+  | a finished run | returns the stored result, rebuilt from the final state. Nothing runs, nothing is emitted. |
+
+- Each `/ask` call that executes steps is one **segment**. Segment `n` opens with
+  `RunStart` (`segment=n`, `seq` restarting at 1) and closes with `RunEnd`, unless the
+  process is killed, in which case it simply stops. A segment without a `RunEnd` was
+  interrupted.
+- The engine persists the new segment number with the run before executing anything in
+  it, so a segment that dies before its first checkpoint still uses up its number.
+- A step may run more than once: resume re-runs the step that was interrupted. Steps must
+  be safe to repeat (sql's are read-only).
+- An engine without persistence (scratch) has no record of any run, so every call is a
+  new run, segment 1. Reusing a `run_id` against scratch starts a second run under the
+  same id: don't.
 
 **`orchestrator_scratch/`** — `engine.py` is the hand-written loop over any `Pipeline`;
 `app.py` wires it to FastAPI for the domain named by `DOMAIN`.
@@ -133,8 +161,13 @@ pin them for scratch):
 `StateGraph`: steps → nodes, `edges` → static edges, `routes` → conditional edges with
 `targets` as the path map, `END` is already LangGraph's `"__end__"`, the domain's
 `RunState` subclass is the state schema, `max_steps` → recursion limit, `run_id` is the
-`thread_id`. Persistent checkpointer: a SQLite file in dev; in-cluster that file lives on
-a PersistentVolumeClaim so resume survives pod restarts. (Postgres later.)
+`thread_id`. Never invoke a used thread with new input: LangGraph starts again at the
+entry step on top of the old state (checked on 1.2.11 — `attempts` carried over). Resume
+is `invoke(None, config)`, which re-runs only the interrupted step. Persistent
+checkpointer: a SQLite file in dev; in-cluster that file lives on a PersistentVolumeClaim
+so resume survives pod restarts. That pins the Deployment to `replicas: 1` with
+`strategy: Recreate`: one writer per SQLite file, and a ReadWriteOnce volume can't be held
+by an old and a new pod at once. (Postgres later lifts both.)
 
 ## `/ask` contract
 
@@ -143,8 +176,9 @@ a PersistentVolumeClaim so resume survives pod restarts. (Postgres later.)
 
 Evidence kinds: `query` (language, query, columns, rows — SQL, PromQL, …), `citation`
 (source, locator, excerpt), `tool` (tool, input, output, ok). `error` set with HTTP 200
-means "could not answer"; a 5xx means the service is broken. Supplying `run_id` resumes a
-LangGraph run (it is the `thread_id`).
+means "could not answer"; a 5xx means the service is broken. `run_id` is optional; what an
+engine does with a supplied one is set out under "Run identity and resume". A 409 means
+the `run_id` names an unfinished run with a different question.
 
 ## Behaviour requirements (every domain, both engines)
 
@@ -155,8 +189,9 @@ LangGraph run (it is the `thread_id`).
   run to `runs/<run_id>.jsonl`. Raw and append-only.
 - An answer is always shown with its evidence.
 - If the data cannot answer the question, say so — never invent data.
-- CLI: `python cli.py --domain sql --target scratch|lg "How many customers are from Brazil?"`
-  (`--domain` defaults to `DOMAIN`; the URL comes from the domain's settings).
+- CLI: `python cli.py --domain sql --target scratch|lg [--run-id ID] "How many customers are from Brazil?"`
+  (`--domain` defaults to `DOMAIN`; the URL comes from the domain's settings; without
+  `--run-id` the CLI generates one and prints it to stderr).
 
 ## Domain: `sql` (first instance)
 
@@ -182,14 +217,6 @@ sample data — no seed jobs, no dialect drift between dev and cluster).
   INSERT/UPDATE/DELETE/DROP/ALTER/ATTACH/PRAGMA; SQLite authorizer as the real boundary;
   append `LIMIT 50` if missing; 5-second timeout.
 
-## Planned domains
-
-- **docs** — retrieve → answer with citations; on a miss, reformulate and retrieve again.
-  Needs a retrieval tool server (embeddings + vector store; pgvector when Postgres lands).
-- **ops** — agentic tool loop over read-only cluster tools (`kubectl get/describe/logs`,
-  PromQL, LogQL) against the harness's own Grafana stack. Guard: verb + namespace
-  allowlist. Mutations would need human approval — deferred.
-
 ## Stack
 
 - Python 3.12, venv + pip, pinned requirements (`requirements.txt` for agents and
@@ -208,7 +235,9 @@ sample data — no seed jobs, no dialect drift between dev and cluster).
   startup. Agent and tool-server images carry `core/` plus their own domain only.
 - API keys: `.env` locally (gitignored); a Kubernetes Secret in-cluster — never in images
   or manifests
-- `pytest`, `ruff`
+- `pytest`, `ruff`. Tests that call a real model provider are marked `live` and excluded
+  from the default run (`pytest -m live` runs them). Evals score a pass rate, never one
+  assert per question: model output varies from run to run.
 - `structlog` for structured logging with context propagation (run_id bound once) —
   replaces the raw `print(json)` in `core/events.py`
 - OpenTelemetry (`opentelemetry-instrumentation-fastapi`, `-httpx`), added once in
@@ -217,19 +246,23 @@ sample data — no seed jobs, no dialect drift between dev and cluster).
 - Grafana stack in-cluster: Tempo (traces), Prometheus (metrics), Loki (logs), Grafana
 - `promptfoo` per domain for offline prompt evaluation; prompt id + sha in the run log tie
   results to prompt versions
-- Later: one Postgres for the LangGraph checkpointer, the event store, and pgvector
+- Later: one Postgres for the LangGraph checkpointer and the event store (and pgvector,
+  if the docs domain lands)
 
 ## Repo layout
 
 ```
-cli.py                      # thin client: --domain, --target
+cli.py                      # thin client: --domain, --target, --run-id
 core/                       # the harness library (see table above)
 orchestrator_scratch/       # engine.py (hand-built loop) + app.py
-orchestrator_lg/            # LangGraph compiler + app (milestone 8)
+orchestrator_lg/            # LangGraph compiler + app (milestone 9)
 domains/
   sql/                      # first domain (see "The domain contract")
 tests/                      # harness tests: engine, registry, agent loop, architecture rules
-infra/                      # base/ + overlays/<domain>/, Makefile targets
+infra/
+  base/docker/              # generic Dockerfiles: service (agents, plain tool servers), orchestrator (per engine)
+  base/compose.yaml         # the engines, extended by every domain overlay
+  overlays/<domain>/        # compose.yaml (make up/down/ps/logs DOMAIN=<name>), kustomize later
 docs/                       # step instructions and explanations
 ```
 
@@ -239,31 +272,49 @@ docs/                       # step instructions and explanations
 2. ✅ Harness restructure: `domains/sql/`, domain-agnostic `core/`, scratch engine runs
    any `Pipeline`, generic `/ask` envelope with evidence, tool-use support in `core.llm`
    + `core.agent_loop`, architecture rules enforced by tests.
-3. Dockerfiles built; the sql domain runs with `docker compose up` (the orchestrator
+3. ✅ Dockerfiles built; the sql domain runs with `docker compose up` (the orchestrator
    image started with `DOMAIN=sql`).
 4. k3d/minikube up, sql domain deployed via `infra/base` + `infra/overlays/sql`; CLI hits
    the in-cluster orchestrator (port-forward).
-5. Joins and aggregations work ("Top 5 artists by total invoice revenue").
-6. Error-retry verified end-to-end: force a failing query, confirm from the logs which
+5. Eval set v0 for sql: `domains/sql/evals/questions.yaml`, about 8 questions with
+   expected result sets (include a join, an aggregation, and one the data cannot answer),
+   scored by exact result-set match against the `query` evidence `/ask` returns. A `live`
+   runner reports the pass rate per question and overall; record it as the baseline.
+6. Joins and aggregations work ("Top 5 artists by total invoice revenue"); the eval pass
+   rate holds at or above the baseline.
+7. Error-retry verified end-to-end: force a failing query, confirm from the logs which
    route handled it (schema re-selection vs. query regeneration) and that the run
    recovered.
-7. Observability: OTel in `create_app` / `core.http` / `core.llm`, Grafana stack deployed
+8. Observability: OTel in `create_app` / `core.http` / `core.llm`, Grafana stack deployed
    in-cluster, structlog replacing raw JSON prints. A cross-service trace for a full run
    visible in Grafana.
-8. `orchestrator_lg` compiles any `Pipeline`; the sql domain works end-to-end locally.
-9. LangGraph orchestrator deployed alongside scratch. Resume verified: kill the pod
-   mid-run, rerun with the same `run_id`, confirm it continues from the checkpoint.
-10. Second domain: `docs`. Acceptance: the domain-contract criterion above holds, and both
-    engines answer docs questions unchanged.
-11. Eval sets per domain (`domains/<name>/evals/questions.yaml`, 20 questions for sql);
-    `pytest` runs every domain's set against both in-cluster orchestrators via `/ask`.
+9. `orchestrator_lg` compiles any `Pipeline` and follows "Run identity and resume"; the
+   sql domain works end-to-end locally and passes the eval set on both engines.
+10. LangGraph orchestrator deployed alongside scratch. Resume verified: kill the pod
+    mid-run and rerun with the same `run_id`. The run continues from the checkpoint; the
+    log shows segment 1 without a `RunEnd` and segment 2 ending in one; a third call with
+    the same `run_id` returns the stored result.
+11. Eval set grown to 20 questions; `pytest -m live` runs it against both in-cluster
+    orchestrators via `/ask` and reports pass rates.
 12. `promptfoo` per domain: LLM-as-judge where needed (exact result-set match for sql),
     baseline snapshot, diff report on prompt changes.
-13. Third domain: `ops` (agentic tool loop, read-only cluster tools).
 
 ## Deliberately deferred (do not build yet)
 
-Event sourcing (`orchestrator_scratch/` will later be refactored into an event-sourced
-`orchestrator_es/` — a third engine over the same `Pipeline`), observer agent (likely
-becomes the ops domain), human-in-the-loop approvals, OpenAI/Gemini adapters, async
-services, web UI.
+- **More domains.** The harness is proven on `sql` (and the toy domain in the tests)
+  first. Each later domain must meet the acceptance criterion above.
+  - **docs** — retrieve → answer with citations; on a miss, reformulate and retrieve
+    again. Settle first: embeddings are a model call, but tool servers have no LLM and no
+    provider SDK. Likely shape: `core.llm.embed()`, the query embedded in the step, and a
+    retrieval tool server doing plain vector search over an index that a domain script
+    builds and bakes into its image (pgvector once Postgres exists).
+  - **ops** — agentic tool loop over read-only cluster tools (`kubectl get/describe/logs`,
+    PromQL, LogQL) against the harness's own Grafana stack. Guard: verb + namespace
+    allowlist in the tool server, with a read-only namespaced RBAC Role as the real
+    boundary (the sql authorizer's counterpart). `ModelCall` logs full prompts, so tool
+    output must never carry secrets: deny `secrets`, redact env values. Mutations would
+    need human approval.
+- Event sourcing (`orchestrator_scratch/` will later be refactored into an event-sourced
+  `orchestrator_es/` — a third engine over the same `Pipeline`), observer agent (likely
+  becomes the ops domain), human-in-the-loop approvals, OpenAI/Gemini adapters, async
+  services, web UI.
