@@ -6,3 +6,7 @@ target-version = "py312"
 # Harness tests live in tests/; each domain's tests live in domains/<name>/tests/.
 testpaths = ["tests", "domains"]
 pythonpath = ["."]
+# Live tests call a real model, so their outcome varies run to run. The default run
+# leaves them out; `pytest -m live` runs only them.
+addopts = "-m 'not live'"
+markers = ["live: calls a real model provider; excluded by default, run with -m live"]

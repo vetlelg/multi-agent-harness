@@ -3,6 +3,8 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from core.events import (
     Event,
     HttpCall,
@@ -115,7 +117,8 @@ def test_sequenced_numbers_from_one_without_mutating() -> None:
         emit_seq(event)
 
     assert [e.seq for e in seen] == [1, 2]
-    assert all(e.seq is None for e in originals)
+    assert [e.segment for e in seen] == [1, 1]
+    assert all(e.seq is None and e.segment is None for e in originals)
 
 
 def test_each_sequence_is_independent() -> None:
@@ -124,3 +127,20 @@ def test_each_sequence_is_independent() -> None:
     sequenced(first.append)(RunEnd(run_id="a", service="s", attempts=0, ok=True))
     sequenced(second.append)(RunEnd(run_id="b", service="s", attempts=0, ok=True))
     assert first[0].seq == second[0].seq == 1
+
+
+def test_a_resumed_segment_numbers_from_one_again() -> None:
+    """Two segments of one run: the log of record is ordered by (segment, seq)."""
+    log: list[Event] = []
+    for segment in (1, 2):
+        emit_seq = sequenced(log.append, segment=segment)
+        emit_seq(RunStart(run_id="r", service="s", question="q", domain="d", orchestrator="o"))
+        emit_seq(RunEnd(run_id="r", service="s", attempts=0, ok=True))
+
+    assert [(e.segment, e.seq) for e in log] == [(1, 1), (1, 2), (2, 1), (2, 2)]
+    assert parse_event(log[2].model_dump_json()).segment == 2
+
+
+def test_segments_start_at_one() -> None:
+    with pytest.raises(ValueError):
+        sequenced(lambda e: None, segment=0)

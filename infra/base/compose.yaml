@@ -1,0 +1,23 @@
+# The harness's half of every domain's compose deployment: the engines.
+#
+# Never run on its own. A domain overlay extends these services and adds the wiring
+# only it knows -- DOMAIN, its service URLs, depends_on, the published port.
+# Relative paths here resolve from this file, even when extended from elsewhere.
+services:
+  orchestrator-scratch:
+    build:
+      context: ../..
+      dockerfile: infra/base/docker/orchestrator.Dockerfile
+      args:
+        ENGINE: orchestrator_scratch
+    image: harness/orchestrator-scratch:dev
+    # Credentials and model choices at run time; never in the image.
+    env_file: ../../.env
+    environment:
+      # The host's Ollama: inside a container, localhost is the container.
+      OLLAMA_HOST: http://host.docker.internal:11434
+      # No run files: each container has its own disk. stdout is the log.
+      RUNS_DIR: ""
+    extra_hosts:
+      # Docker Desktop provides this name; Docker Engine on Linux needs it spelled out.
+      - host.docker.internal:host-gateway

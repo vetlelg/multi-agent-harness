@@ -1,4 +1,8 @@
-"""Live calls against whichever providers are reachable. Skipped when none are."""
+"""Live calls against whichever providers are reachable. Skipped when none are.
+
+Marked ``live``: outside the default run, because a real model's output varies --
+``llama3.1:8b`` sometimes runs past the token cap. Run with ``pytest -m live``.
+"""
 
 from __future__ import annotations
 
@@ -10,6 +14,8 @@ from core.config import settings
 from core.events import Event, RunContext, ToolCall
 from core.llm import LLMRequest, LLMResult, StopReason, get_client
 from core.prompts import Prompt
+
+pytestmark = pytest.mark.live
 
 _ANTHROPIC_MODEL = "anthropic:claude-opus-5"
 

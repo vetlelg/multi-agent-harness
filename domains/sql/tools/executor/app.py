@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import sqlite3
 import time
-from contextlib import contextmanager
+from collections.abc import Iterator
+from contextlib import closing, contextmanager
 
 from core.events import ToolCall, emit
 from core.service import create_app
@@ -21,75 +22,83 @@ from domains.sql.tools.executor.guard import make_authorizer, validate_and_rewri
 SERVICE = "executor"
 app = create_app(SERVICE)
 
-_db_uri = f"file:{settings.db_path}?mode=ro"
+_DB_URI = f"file:{settings.db_path}?mode=ro"
 
-_intro_conn = sqlite3.connect(_db_uri, uri=True, check_same_thread=False)
-_intro_conn.row_factory = sqlite3.Row
 
-_exec_conn = sqlite3.connect(_db_uri, uri=True, check_same_thread=False)
-_exec_conn.set_authorizer(make_authorizer())
+def _connect() -> sqlite3.Connection:
+    """A new read-only connection. No connection is ever shared between requests."""
+    return sqlite3.connect(_DB_URI, uri=True)
 
 
 def _introspect() -> SchemaResponse:
-    cursor = _intro_conn.cursor()
-    tables: list[TableInfo] = []
+    # No authorizer on this connection: introspection needs PRAGMA.
+    with closing(_connect()) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        tables: list[TableInfo] = []
 
-    for row in cursor.execute(
-        "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
-    ).fetchall():
-        name = row["name"]
-        if name.startswith("sqlite_"):
-            continue
+        for row in cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+        ).fetchall():
+            name = row["name"]
+            if name.startswith("sqlite_"):
+                continue
 
-        columns: list[ColumnInfo] = []
-        for col in cursor.execute(f"PRAGMA table_info({name})").fetchall():
-            columns.append(
-                ColumnInfo(
-                    name=col["name"],
-                    type=col["type"] or "",
-                    nullable=col["notnull"] == 0,
-                    pk=col["pk"] > 0,
+            columns: list[ColumnInfo] = []
+            for col in cursor.execute(f"PRAGMA table_info({name})").fetchall():
+                columns.append(
+                    ColumnInfo(
+                        name=col["name"],
+                        type=col["type"] or "",
+                        nullable=col["notnull"] == 0,
+                        pk=col["pk"] > 0,
+                    )
                 )
-            )
 
-        foreign_keys: list[ForeignKeyInfo] = []
-        for fk in cursor.execute(f"PRAGMA foreign_key_list({name})").fetchall():
-            foreign_keys.append(
-                ForeignKeyInfo(
-                    column=fk["from"],
-                    references_table=fk["table"],
-                    references_column=fk["to"],
+            foreign_keys: list[ForeignKeyInfo] = []
+            for fk in cursor.execute(f"PRAGMA foreign_key_list({name})").fetchall():
+                foreign_keys.append(
+                    ForeignKeyInfo(
+                        column=fk["from"],
+                        references_table=fk["table"],
+                        references_column=fk["to"],
+                    )
                 )
-            )
 
-        tables.append(TableInfo(name=name, columns=columns, foreign_keys=foreign_keys))
+            tables.append(TableInfo(name=name, columns=columns, foreign_keys=foreign_keys))
 
     return SchemaResponse(tables=tables)
 
 
-_cached_schema: SchemaResponse | None = None
+#: Read once at startup: the database is baked into the image and never changes.
+_SCHEMA = _introspect()
 
 
 @app.get("/schema")
 def schema() -> SchemaResponse:
-    global _cached_schema
-    if _cached_schema is None:
-        _cached_schema = _introspect()
-    return _cached_schema
+    return _SCHEMA
 
 
 @contextmanager
-def _timeout_guard(timeout_s: float):
-    start = time.monotonic()
+def _query_connection(timeout_s: float) -> Iterator[sqlite3.Connection]:
+    """A connection for one query: read-only, authorizer on, timeout armed from now.
 
-    def handler() -> int:
-        return 1 if (time.monotonic() - start) > timeout_s else 0
-
-    _exec_conn.set_progress_handler(handler, 1000)
+    One per request, never shared. The authorizer and the progress handler belong
+    to the connection: on a shared one, a request finishing cleared the timeout of
+    another still running, and every query waited for the one ahead of it.
+    """
+    conn = _connect()
     try:
-        yield
+        conn.set_authorizer(make_authorizer())
+        start = time.monotonic()
+
+        def handler() -> int:
+            return 1 if (time.monotonic() - start) > timeout_s else 0
+
+        conn.set_progress_handler(handler, 1000)
+        yield conn
     finally:
-        _exec_conn.set_progress_handler(None, 0)
+        conn.close()
 
 
 def _emit(request: ExecuteRequest, response: ExecuteResponse) -> ExecuteResponse:
@@ -136,8 +145,8 @@ def execute(request: ExecuteRequest) -> ExecuteResponse:
         )
 
     try:
-        with _timeout_guard(settings.query_timeout_s):
-            cursor = _exec_conn.execute(rewritten)
+        with _query_connection(settings.query_timeout_s) as conn:
+            cursor = conn.execute(rewritten)
             if cursor.description:
                 columns = [col[0] for col in cursor.description]
                 raw_rows = cursor.fetchall()

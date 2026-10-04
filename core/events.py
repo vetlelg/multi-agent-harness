@@ -17,6 +17,12 @@ Sequence numbers: a run crosses several processes, which cannot share a counter.
 Orchestrators number their events and own the ordered log of record. Agents and
 tool servers emit the same run_id for correlation but leave ``seq`` unset and
 make no claim to be replayable.
+
+Segments: a resumed run is executed by more than one ``/ask`` call, possibly in
+more than one process, and a new process cannot know how far the last one
+numbered -- events emitted after the last checkpoint were never persisted
+anywhere it can read. So each call is a segment with its own ``seq`` from 1, and
+a run's log of record is ordered by ``(segment, seq)``.
 """
 
 from __future__ import annotations
@@ -35,7 +41,8 @@ from core.config import settings
 #: Bump when an event's fields change incompatibly, so consumers can tell.
 #: 2: domain on RunStart; prompt id/sha, system and params on ModelCall;
 #:    ToolCall replaced SqlExecute; error_type became a plain string.
-SCHEMA_VERSION = 2
+#: 3: segment on every event, set with seq.
+SCHEMA_VERSION = 3
 
 
 def _utc_now() -> str:
@@ -57,7 +64,10 @@ class Event(BaseModel):
     run_id: str
     service: str
     type: str
-    #: Set by orchestrators only, starting at 1 and incrementing per run.
+    #: Set by orchestrators only: which ``/ask`` call of the run emitted this.
+    #: 1 for a new run, one more for each resume.
+    segment: int | None = None
+    #: Set by orchestrators only, starting at 1 and incrementing per segment.
     seq: int | None = None
 
 
@@ -169,15 +179,18 @@ def emit(event: Event) -> None:
 Emitter = Callable[[Event], None]
 
 
-def sequenced(emitter: Emitter = emit) -> Emitter:
-    """An emitter that numbers events 1, 2, 3 ... before passing them on.
+def sequenced(emitter: Emitter = emit, *, segment: int = 1) -> Emitter:
+    """An emitter that stamps ``segment`` and numbers events 1, 2, 3 ... before passing them on.
 
-    One per run, created by the orchestrator. Agents never use it.
+    One per segment, created by the orchestrator: ``segment=1`` for a new run, the
+    persisted next number when resuming. Agents never use it.
     """
+    if segment < 1:
+        raise ValueError(f"segments are numbered from 1, got {segment}")
     counter = itertools.count(1)
 
     def _emit(event: Event) -> None:
-        emitter(event.model_copy(update={"seq": next(counter)}))
+        emitter(event.model_copy(update={"segment": segment, "seq": next(counter)}))
 
     return _emit
 

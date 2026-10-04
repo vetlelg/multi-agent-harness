@@ -1,0 +1,73 @@
+# The sql domain, run locally:
+#
+#   docker compose -f infra/overlays/sql/compose.yaml up --build --wait     (or: make up)
+#   python cli.py --target scratch "How many customers are from Brazil?"
+#
+# Service names are hostnames, and step 4 reuses them as Kubernetes Service names:
+# hyphens, never underscores. Every container listens on 8000.
+name: harness-sql
+
+# What every model-calling sql container needs on top of .env, overriding the
+# localhost values .env has for local processes.
+x-sql-env: &sql-env
+  OLLAMA_HOST: http://host.docker.internal:11434
+  RUNS_DIR: ""
+  SQL_EXECUTOR_URL: http://executor:8000
+  SQL_SCHEMA_AGENT_URL: http://schema-agent:8000
+  SQL_QUERY_AGENT_URL: http://query-agent:8000
+
+services:
+  # No env_file: the executor calls no model and is given no credentials.
+  executor:
+    build:
+      context: ../../..
+      dockerfile: domains/sql/tools/executor/Dockerfile
+    image: harness/sql-executor:dev
+
+  schema-agent:
+    build:
+      context: ../../..
+      dockerfile: infra/base/docker/service.Dockerfile
+      args:
+        DOMAIN: sql
+        APP: domains.sql.agents.schema_agent.app:app
+    image: harness/sql-schema-agent:dev
+    env_file: ../../../.env
+    environment: *sql-env
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    depends_on:
+      executor:
+        condition: service_healthy
+
+  query-agent:
+    build:
+      context: ../../..
+      dockerfile: infra/base/docker/service.Dockerfile
+      args:
+        DOMAIN: sql
+        APP: domains.sql.agents.query_agent.app:app
+    image: harness/sql-query-agent:dev
+    env_file: ../../../.env
+    environment: *sql-env
+    extra_hosts:
+      - host.docker.internal:host-gateway
+
+  orchestrator-scratch:
+    extends:
+      file: ../../base/compose.yaml
+      service: orchestrator-scratch
+    environment:
+      <<: *sql-env
+      DOMAIN: sql
+    # The only published port, on loopback only. 8100 is where SQL_SCRATCH_URL in
+    # .env already points, so the CLI is unchanged.
+    ports:
+      - 127.0.0.1:8100:8000
+    depends_on:
+      executor:
+        condition: service_healthy
+      schema-agent:
+        condition: service_healthy
+      query-agent:
+        condition: service_healthy

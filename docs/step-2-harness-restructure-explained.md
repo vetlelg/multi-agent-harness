@@ -135,7 +135,7 @@ Each agent used to time its own model call and hand-build a 13-field `ModelCall`
 orchestrator did the same for every HTTP call. A new domain would copy that, and drift.
 Now `llm.call_model(ctx, …)` and `http.post(ctx, …)` emit the events themselves, and
 `create_app` builds every service with `/healthz`. These three are also where OTel goes in
-milestone 7: added once, inherited by every domain.
+milestone 8: added once, inherited by every domain.
 
 `RunContext` is what they share: which run, which service, where events go.
 Orchestrators give it a `sequenced` emitter (numbered events); agents use plain `emit`.
@@ -183,4 +183,4 @@ did, the toy domain couldn't run. It is also the smallest example of the domain 
 Not verified: the Anthropic adapter's tool-use path against the real API (no key
 configured — it is covered by offline tests against stand-in responses), and the retry
 routes against a live model (covered by `test_domain.py` with stubbed services; live
-verification is milestone 6).
+verification is milestone 7).

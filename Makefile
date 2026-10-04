@@ -4,7 +4,23 @@ DB_TMP := $(DB_PATH).tmp
 DB_SHA256 := bdf635be69850bd3be09c9a2dbeef7ddfb80036bd3ef3381383cd03b61e4a61a
 DB_SIZE := 1067008
 
-.PHONY: db
+# Which domain's compose stack the targets below drive: make up DOMAIN=<name>
+DOMAIN ?= sql
+COMPOSE := docker compose -f infra/overlays/$(DOMAIN)/compose.yaml
+
+.PHONY: db up down ps logs
+
+up:
+	$(COMPOSE) up --build --wait
+
+down:
+	$(COMPOSE) down
+
+ps:
+	$(COMPOSE) ps
+
+logs:
+	$(COMPOSE) logs -f
 
 db:
 	@mkdir -p data
