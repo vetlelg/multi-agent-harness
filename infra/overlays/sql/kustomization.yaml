@@ -1,0 +1,31 @@
+# The sql domain in the local k3d cluster:
+#
+#   make k8s-up          (cluster if missing, build, import, Secret, apply, roll out)
+#   make k8s-forward     (second terminal)
+#   python cli.py --target scratch "How many customers are from Brazil?"
+#
+# Render without applying: kubectl kustomize infra/overlays/sql
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# Also renames the base's Namespace object.
+namespace: harness-sql
+resources:
+  - ../../base
+  - executor.yaml
+  - schema-agent.yaml
+  - query-agent.yaml
+configMapGenerator:
+  # The name the base's orchestrator reads. The generated name carries a content hash,
+  # so a change here rolls the pods that use it.
+  - name: domain-env
+    literals:
+      - DOMAIN=sql
+      - SQL_EXECUTOR_URL=http://executor:8000
+      - SQL_SCHEMA_AGENT_URL=http://schema-agent:8000
+      - SQL_QUERY_AGENT_URL=http://query-agent:8000
+      # The cluster doesn't read .env: the deployed models are declared here. This
+      # local cluster uses the host's Ollama and needs no key. For Claude, set
+      # anthropic:claude-opus-5 and put ANTHROPIC_API_KEY in .env.
+      - SQL_SCHEMA_MODEL=ollama:llama3.1:8b
+      - SQL_QUERY_MODEL=ollama:llama3.1:8b
+      - SQL_ANSWER_MODEL=ollama:llama3.1:8b

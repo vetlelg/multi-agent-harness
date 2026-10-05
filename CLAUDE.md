@@ -94,8 +94,18 @@ domains/<name>/
                    #   more than Python packages; the sql executor bakes in its database)
   tests/           # its unit tests (collected by the root pytest run)
   evals/           # questions + expected answers, promptfoo config
-infra/overlays/<name>/  # its deployment: compose.yaml now, kustomize from milestone 4
+infra/overlays/<name>/  # its deployment: compose.yaml + a kustomize overlay
+                        #   (kustomization.yaml, one manifest per service)
 ```
+
+**In the cluster**, an overlay includes `infra/base`, sets `namespace: harness-<name>`,
+and generates the ConfigMap `domain-env`: `DOMAIN=<name>` plus its `<NAME>_*` settings,
+models included (the cluster never reads `.env`). The base's orchestrator reads it by that
+name. Model-calling pods take `envFrom` ConfigMap `harness-env`, ConfigMap `domain-env`,
+and Secret `llm-credentials`. That Secret holds only the API keys; `make k8s-up` creates
+it from `.env`, so it is never in a manifest. Tool servers get none of the three. Images
+are imported, never pulled (`imagePullPolicy: Never`). Every pod must pass the
+`restricted` Pod Security Standard, which the base's Namespace enforces.
 
 **Adding a domain — acceptance criterion:** outside `domains/<name>/` and
 `infra/overlays/<name>/`, the only file that changes is `.env.example`. If anything else
@@ -230,11 +240,12 @@ sample data — no seed jobs, no dialect drift between dev and cluster).
 - FastAPI per service via `core.service.create_app`; every service exposes `GET /healthz`
 - httpx for inter-service calls (`core.http`)
 - `langgraph` (in `orchestrator_lg/` only)
-- Docker, k3d or minikube, kustomize: `infra/base/` (harness) + `infra/overlays/<domain>/`.
+- Docker, k3d 5.9 (k3s v1.35, pinned by digest), kustomize (built into kubectl):
+  `infra/base/` (harness) + `infra/overlays/<domain>/`.
   One image per engine, containing `core/` and `domains/`; `DOMAIN` picks the domain at
   startup. Agent and tool-server images carry `core/` plus their own domain only.
-- API keys: `.env` locally (gitignored); a Kubernetes Secret in-cluster — never in images
-  or manifests
+- API keys: `.env` locally (gitignored); a Kubernetes Secret in-cluster (`llm-credentials`,
+  made from `.env` by `make k8s-up`) — never in images or manifests
 - `pytest`, `ruff`. Tests that call a real model provider are marked `live` and excluded
   from the default run (`pytest -m live` runs them). Evals score a pass rate, never one
   assert per question: model output varies from run to run.
@@ -262,7 +273,12 @@ tests/                      # harness tests: engine, registry, agent loop, archi
 infra/
   base/docker/              # generic Dockerfiles: service (agents, plain tool servers), orchestrator (per engine)
   base/compose.yaml         # the engines, extended by every domain overlay
-  overlays/<domain>/        # compose.yaml (make up/down/ps/logs DOMAIN=<name>), kustomize later
+  base/k3d.yaml             # the local cluster, shared by every domain (make cluster)
+  base/kustomization.yaml   # + namespace.yaml, orchestrator-scratch.yaml: the namespace policy
+                            #   and the engines, included by every domain overlay
+  overlays/<domain>/        # compose.yaml (make up/down/ps/logs DOMAIN=<name>);
+                            #   kustomization.yaml + one manifest per service
+                            #   (make k8s-up/k8s-down/k8s-ps/k8s-logs/k8s-forward DOMAIN=<name>)
 docs/                       # step instructions and explanations
 ```
 
@@ -274,7 +290,7 @@ docs/                       # step instructions and explanations
    + `core.agent_loop`, architecture rules enforced by tests.
 3. ✅ Dockerfiles built; the sql domain runs with `docker compose up` (the orchestrator
    image started with `DOMAIN=sql`).
-4. k3d/minikube up, sql domain deployed via `infra/base` + `infra/overlays/sql`; CLI hits
+4. ✅ k3d up, sql domain deployed via `infra/base` + `infra/overlays/sql`; CLI hits
    the in-cluster orchestrator (port-forward).
 5. Eval set v0 for sql: `domains/sql/evals/questions.yaml`, about 8 questions with
    expected result sets (include a join, an aggregation, and one the data cannot answer),

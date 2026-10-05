@@ -1,0 +1,12 @@
+# Every domain's namespace, under the restricted Pod Security Standard.
+#
+# The name is a placeholder: an overlay's `namespace:` field renames this object to
+# harness-<domain>. enforce rejects non-compliant pods; warn reports a non-compliant
+# Deployment when it is applied, instead of leaving it silently stuck at 0/1.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: harness-domain
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/warn: restricted
