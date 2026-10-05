@@ -1,0 +1,17 @@
+# The harness's half of every domain's cluster deployment: the namespace policy and the
+# engines.
+#
+# Never applied on its own. A domain overlay includes it, sets `namespace:`, and
+# generates the ConfigMap domain-env (DOMAIN plus its own settings) that the
+# orchestrator reads. Apply the overlay: kubectl apply -k infra/overlays/<domain>
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - orchestrator-scratch.yaml
+configMapGenerator:
+  # What every model-calling pod in every domain needs from the cluster.
+  - name: harness-env
+    literals:
+      # The host's Ollama. k3d adds this name to CoreDNS.
+      - OLLAMA_HOST=http://host.k3d.internal:11434

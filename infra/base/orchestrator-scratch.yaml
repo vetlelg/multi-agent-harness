@@ -1,0 +1,87 @@
+# The hand-built engine, for whichever domain the overlay names in domain-env.
+#
+# Every service manifest, in the base and in each overlay, has this shape: one
+# Deployment and one ClusterIP Service, named after the service, selected by the single
+# label app.kubernetes.io/name.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orchestrator-scratch
+  labels:
+    app.kubernetes.io/name: orchestrator-scratch
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: orchestrator-scratch
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: orchestrator-scratch
+    spec:
+      # Nothing here talks to the Kubernetes API, so no token is mounted.
+      automountServiceAccountToken: false
+      # Discovery is by DNS; no <SERVICE>_PORT variables in the environment.
+      enableServiceLinks: false
+      securityContext:
+        # The image's numeric USER 10001 is what makes this verifiable.
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: orchestrator-scratch
+          image: harness/orchestrator-scratch:dev
+          # Imported with k3d image import, never pulled: on Docker Hub, harness/ is
+          # somebody else's organisation.
+          imagePullPolicy: Never
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: harness-env
+            # Provided by the overlay: DOMAIN and the domain's own settings.
+            - configMapRef:
+                name: domain-env
+            # API keys only, created from .env by make k8s-up; never in a manifest.
+            - secretRef:
+                name: llm-credentials
+          # Shallow on purpose: a probe that checked dependencies would restart
+          # healthy pods whenever a dependency is down.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            # No CPU limit: it would throttle even on an idle node.
+            limits:
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orchestrator-scratch
+  labels:
+    app.kubernetes.io/name: orchestrator-scratch
+spec:
+  selector:
+    app.kubernetes.io/name: orchestrator-scratch
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
