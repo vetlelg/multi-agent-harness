@@ -21,6 +21,8 @@ class ErrorType(str, Enum):
     GUARD_REJECTED = "guard_rejected"
     TIMEOUT = "timeout"
     OTHER = "other"
+    #: Never from SQLite: a step found that the data cannot answer the question.
+    UNANSWERABLE = "unanswerable"
 
 
 class GuardRejection(Exception):
@@ -38,8 +40,16 @@ _PREFIXES: tuple[tuple[str, ErrorType], ...] = (
     ("no such function:", ErrorType.SYNTAX),
     ('near "', ErrorType.SYNTAX),
     ("wrong number of arguments to function", ErrorType.SYNTAX),
+    ("ambiguous column name:", ErrorType.SYNTAX),
+    ("misuse of aggregate", ErrorType.SYNTAX),
     ("interrupted", ErrorType.TIMEOUT),
 )
+
+# SQLite's hint when a double-quoted name matches no column (the executor turns
+# double-quoted strings off). Usually a string written in double quotes: a mistake
+# in the SQL for the query agent to fix, not a schema to select again. The message
+# starts "no such column:", so this is checked first.
+_DQS_HINT = "should this be a string literal in single-quotes?"
 
 # MISSING_OBJECT rewinds to schema selection; SYNTAX rewinds to SQL generation.
 # The rest mean our own machinery refused or gave up, and retrying repeats it.
@@ -57,6 +67,8 @@ def classify_sql_error(error: Exception | str) -> ErrorType:
         return ErrorType.GUARD_REJECTED
 
     message = (error if isinstance(error, str) else str(error)).strip()
+    if message.endswith(_DQS_HINT):
+        return ErrorType.SYNTAX
     for prefix, error_type in _PREFIXES:
         if message.startswith(prefix):
             return error_type

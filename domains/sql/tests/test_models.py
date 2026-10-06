@@ -32,6 +32,7 @@ _ROUND_TRIP_CASES = [
     SelectSchemaResponse(tables=[_TABLE], schema_text="Album(id INTEGER PK)"),
     GenerateSqlRequest(run_id="r1", question="How many?", schema_text="...", attempt=1),
     GenerateSqlResponse(sql="SELECT 1"),
+    GenerateSqlResponse(missing="no birth date"),
     ExecuteRequest(run_id="r1", sql="SELECT 1"),
     ExecuteResponse(ok=True, elapsed_ms=5),
     ExecuteResponse(ok=False, elapsed_ms=5, error_type=ErrorType.SYNTAX, error='near "x"'),
@@ -48,6 +49,14 @@ def test_round_trip(model) -> None:
 def test_internal_requests_carry_run_id() -> None:
     with pytest.raises(ValidationError):
         ExecuteRequest(sql="SELECT 1")
+
+
+@pytest.mark.parametrize(
+    "fields", [{}, {"sql": "SELECT 1", "missing": "x"}], ids=["neither", "both"]
+)
+def test_generate_sql_response_is_sql_or_missing(fields: dict) -> None:
+    with pytest.raises(ValidationError):
+        GenerateSqlResponse(**fields)
 
 
 def test_state_stores_error_type_as_plain_string() -> None:

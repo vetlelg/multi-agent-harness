@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 
 from domains.sql.config import settings
+from domains.sql.models import SqlOut
 
 
 def test_agents_report_healthy() -> None:
@@ -97,3 +99,80 @@ def test_one_request_finishing_does_not_disarm_another() -> None:
             fast.execute("SELECT 1").fetchall()
         with pytest.raises(sqlite3.OperationalError, match="interrupted"):
             slow.execute(_LONG_QUERY).fetchall()
+
+
+@needs_db
+def test_executor_reads_double_quotes_as_names_only(executor) -> None:
+    sql = 'SELECT COUNT(*) FROM Artist WHERE Name = "AC/DC"'
+    body = executor.post("/execute", json={"run_id": "r1", "sql": sql}).json()
+
+    assert body["ok"] is False
+    assert body["error_type"] == "syntax"
+    assert "single-quotes" in body["error"]
+
+
+@needs_db
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM Track LIMIT 1000",
+        "SELECT * FROM (SELECT * FROM Track LIMIT 5) UNION ALL SELECT * FROM Track",
+    ],
+    ids=["own-limit", "limit-in-subquery"],
+)
+def test_executor_caps_rows_whatever_the_sql_says(executor, sql: str) -> None:
+    body = executor.post("/execute", json={"run_id": "r1", "sql": sql}).json()
+
+    assert body["row_count"] == len(body["rows"]) == settings.row_limit
+    assert body["truncated"] is True
+
+
+@needs_db
+def test_schema_agent_adds_the_join_path(executor, monkeypatch) -> None:
+    from core import http, llm
+    from domains.sql.agents.schema_agent.app import app
+    from domains.sql.models import SchemaResponse, SelectedSchemaOut
+
+    schema = SchemaResponse.model_validate(executor.get("/schema").json())
+    monkeypatch.setattr(http, "get", lambda ctx, **kwargs: schema)
+    monkeypatch.setattr(
+        llm,
+        "call_model",
+        lambda ctx, **kwargs: SimpleNamespace(
+            parsed=SelectedSchemaOut(tables=["Invoice", "Artist"])
+        ),
+    )
+
+    body = TestClient(app).post("/select-schema", json={"run_id": "r1", "question": "q"}).json()
+
+    assert [t["name"] for t in body["tables"]] == [
+        "Album",
+        "Artist",
+        "Invoice",
+        "InvoiceLine",
+        "Track",
+    ]
+    assert "REFERENCES Artist(ArtistId)" in body["schema_text"]
+    assert "Album.ArtistId = Artist.ArtistId" in body["schema_text"]
+
+
+@pytest.mark.parametrize(
+    ("out", "expected"),
+    [
+        (
+            SqlOut(answerable=False, missing="no birth date", sql=""),
+            {"sql": None, "missing": "no birth date"},
+        ),
+        (SqlOut(answerable=False, missing="", sql=""), {"sql": None, "missing": "no reason given"}),
+        (SqlOut(answerable=True, missing="", sql="SELECT 1"), {"sql": "SELECT 1", "missing": None}),
+    ],
+    ids=["declined", "declined-without-reason", "answered"],
+)
+def test_query_agent_may_decline(monkeypatch, out: SqlOut, expected: dict) -> None:
+    from core import llm
+    from domains.sql.agents.query_agent.app import app
+
+    monkeypatch.setattr(llm, "call_model", lambda ctx, **kwargs: SimpleNamespace(parsed=out))
+    body = {"run_id": "r1", "question": "q", "schema_text": "T (n INTEGER)", "attempt": 1}
+
+    assert TestClient(app).post("/generate-sql", json=body).json() == expected

@@ -6,7 +6,7 @@ an error) and ``AgentRequest`` (every internal request carries the run_id).
 
 from __future__ import annotations
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from core.models import AgentRequest, Row, Strict
 from core.pipeline import RunState
@@ -70,7 +70,18 @@ class GenerateSqlRequest(AgentRequest):
 
 
 class GenerateSqlResponse(Strict):
-    sql: str
+    """The query, or why the agent declined to write one. Exactly one is set."""
+
+    #: None when the agent found that the schema cannot answer the question.
+    sql: str | None = None
+    #: What the question needs that the schema lacks.
+    missing: str | None = None
+
+    @model_validator(mode="after")
+    def _sql_or_missing(self) -> GenerateSqlResponse:
+        if (self.sql is None) == (self.missing is None):
+            raise ValueError("give exactly one of sql or missing")
+        return self
 
 
 class ExecuteRequest(AgentRequest):
@@ -100,22 +111,28 @@ class ExecuteResponse(Strict):
 
 
 class SqlOut(Strict):
+    """What the query agent's model call returns.
+
+    Field order is generation order: the model decides whether the schema can
+    answer, and says what is missing, before it writes any SQL.
+    """
+
+    answerable: bool
+    #: What the question needs that the schema lacks; "" when answerable.
+    missing: str
+    #: "" when not answerable.
     sql: str
 
 
-class SelectedTableOut(Strict):
-    name: str
-    columns: list[str]
-
-
 class SelectedSchemaOut(Strict):
-    """What the schema agent's model call returns: names only.
+    """What the schema agent's model call returns: table names only.
 
-    Types, nullability and foreign keys are looked up from the real introspected
-    schema rather than re-emitted by the model, so they cannot be hallucinated.
+    Columns, types, keys and the joins between the tables come from the real
+    introspected schema rather than from the model, so they cannot be
+    hallucinated or left out.
     """
 
-    tables: list[SelectedTableOut]
+    tables: list[str]
 
 
 class AnswerOut(Strict):

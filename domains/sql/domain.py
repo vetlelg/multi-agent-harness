@@ -4,9 +4,13 @@ Everything both orchestrators do for a SQL question is defined here, once.
 The engines only decide how it is executed.
 
     get_schema -> generate_sql -> execute -(route)-> answer -> END
-                       ^             |  |
-                       |  syntax     |  |  missing table/column
-                       +-------------+  +-> get_schema
+         ^             ^             |  |
+         |             |  syntax     |  |
+         |             +-------------+  |
+         +------------------------------+  missing table/column
+
+get_schema and generate_sql route to answer instead when they find that the
+data cannot answer the question: no table selected, or the query agent declined.
 """
 
 from __future__ import annotations
@@ -33,6 +37,9 @@ from domains.sql.models import (
 
 _ANSWER_PROMPT = load_prompt(PROMPTS / "answer.txt")
 
+#: Starts the run's error when a step finds that the data cannot answer.
+CANNOT_ANSWER = "the data cannot answer this: "
+
 
 # --------------------------------------------------------------------------- #
 # Steps                                                                         #
@@ -54,6 +61,12 @@ def get_schema(state: SqlState, ctx: RunContext) -> dict[str, Any]:
         ),
         response_model=SelectSchemaResponse,
     )
+    if not response.tables:
+        return {
+            "schema_text": response.schema_text,
+            "error": CANNOT_ANSWER + "no table holds what the question asks for",
+            "error_type": ErrorType.UNANSWERABLE,
+        }
     return {"schema_text": response.schema_text}
 
 
@@ -73,6 +86,9 @@ def generate_sql(state: SqlState, ctx: RunContext) -> dict[str, Any]:
         ),
         response_model=GenerateSqlResponse,
     )
+    if response.sql is None:
+        # ``sql`` keeps the last query attempted, if any: the decline rests on it.
+        return {"error": CANNOT_ANSWER + response.missing, "error_type": ErrorType.UNANSWERABLE}
     return {"sql": response.sql}
 
 
@@ -107,13 +123,20 @@ def execute(state: SqlState, ctx: RunContext) -> dict[str, Any]:
 
 
 def answer(state: SqlState, ctx: RunContext) -> dict[str, Any]:
-    """Turn rows -- or the last failure -- into a plain-language answer."""
+    """Turn rows -- or why there are none -- into a plain-language answer."""
     if state.rows is not None:
         parts = [
             f"## Question\n{state.question}",
             f"## SQL Executed\n{state.sql_executed or state.sql}",
             f"## Results\nColumns: {state.columns}\nRows:\n{state.rows}",
         ]
+        if state.truncated:
+            parts.append(
+                f"## Note\nThe result was cut at {len(state.rows)} rows; "
+                "the full result may have more."
+            )
+    elif state.error_type == ErrorType.UNANSWERABLE:
+        parts = [f"## Question\n{state.question}", f"## Cannot answer\n{state.error}"]
     else:
         parts = [
             f"## Question\n{state.question}",
@@ -136,8 +159,21 @@ def answer(state: SqlState, ctx: RunContext) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
-# Route                                                                         #
+# Routes                                                                        #
 # --------------------------------------------------------------------------- #
+
+
+def _unless_unanswerable(next_step: str) -> Route[SqlState]:
+    """On to ``next_step``, unless the step just run found the data cannot answer.
+
+    Only that step can have set ``unanswerable``: a failed execution leaves
+    ``syntax`` or ``missing_object`` behind, and a retry goes on past it.
+    """
+
+    def decide(state: SqlState) -> str:
+        return "answer" if state.error_type == ErrorType.UNANSWERABLE else next_step
+
+    return Route(decide=decide, targets=frozenset({next_step, "answer"}))
 
 
 def route_after_execute(state: SqlState) -> str:
@@ -187,12 +223,10 @@ PIPELINE = Pipeline(
         "execute": execute,
         "answer": answer,
     },
-    edges={
-        "get_schema": "generate_sql",
-        "generate_sql": "execute",
-        "answer": END,
-    },
+    edges={"answer": END},
     routes={
+        "get_schema": _unless_unanswerable("generate_sql"),
+        "generate_sql": _unless_unanswerable("execute"),
         "execute": Route(
             decide=route_after_execute,
             targets=frozenset({"get_schema", "generate_sql", "answer"}),

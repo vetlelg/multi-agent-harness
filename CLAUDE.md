@@ -221,21 +221,27 @@ downloads it. The file is baked into the executor image (deliberate: small, read
 sample data — no seed jobs, no dialect drift between dev and cluster).
 
 - **schema_agent** (agent) — fetches the full schema from the executor's `/schema`, then
-  the model selects the relevant tables and columns. Types and foreign keys are looked up
-  from the real schema, never re-emitted by the model.
-- **query_agent** (agent) — question + selected schema → one SQL statement. On retry also
-  receives the previous SQL and the error.
+  the model names the relevant tables. Code adds the tables on the shortest foreign-key
+  paths between them, takes every column, type and foreign key from the real schema (the
+  model never re-emits them), and lists the join conditions between them. An empty
+  selection means the data cannot answer.
+- **query_agent** (agent) — question + selected schema → one SQL statement, or a decline
+  saying what the schema lacks. On retry also receives the previous SQL and the error.
 - **executor** (tool server) — the only service with database access. No LLM.
   `GET /schema` (introspection) and `POST /execute` (guard → run → rows or classified
   error).
-- **Pipeline** — `get_schema → generate_sql → execute → (route) → answer`. Route after
-  `execute`: success → `answer`; `missing_object` ("no such table/column") with attempts
-  left → `get_schema`; other retryable error with attempts left → `generate_sql`;
-  exhausted or non-retryable → `answer` (failure explanation). `SQL_MAX_ATTEMPTS`
-  executions per run (default 3).
+- **Pipeline** — `get_schema → generate_sql → execute → (route) → answer`. After
+  `get_schema` and after `generate_sql`, a route to `answer` when the step found the data
+  cannot answer (no table selected, or the query agent declined: `error_type`
+  `unanswerable`). Route after `execute`: success → `answer`; `missing_object` ("no such
+  table/column") with attempts left → `get_schema`; other retryable error with attempts
+  left → `generate_sql`; exhausted or non-retryable → `answer` (failure explanation).
+  `SQL_MAX_ATTEMPTS` executions per run (default 3).
 - **Guard** — one read-only statement: `SELECT` or `WITH … SELECT`; reject
   INSERT/UPDATE/DELETE/DROP/ALTER/ATTACH/PRAGMA; SQLite authorizer as the real boundary;
-  append `LIMIT 50` if missing; 5-second timeout.
+  double-quoted strings off (DQS), so a quoted name that matches no column is an error,
+  not a string; append `LIMIT 50` if missing, and return at most 50 rows whatever `LIMIT`
+  the SQL has; 5-second timeout.
 
 ## Stack
 
@@ -307,7 +313,7 @@ docs/                       # step instructions and explanations
    expected result sets (include a join, an aggregation, and one the data cannot answer),
    scored by exact result-set match against the `query` evidence `/ask` returns. A `live`
    runner reports the pass rate per question and overall; record it as the baseline.
-6. Joins and aggregations work ("Top 5 artists by total invoice revenue"); the eval pass
+6. ✅ Joins and aggregations work ("Top 5 artists by total invoice revenue"); the eval pass
    rate holds at or above the baseline.
 7. Error-retry verified end-to-end: force a failing query, confirm from the logs which
    route handled it (schema re-selection vs. query regeneration) and that the run

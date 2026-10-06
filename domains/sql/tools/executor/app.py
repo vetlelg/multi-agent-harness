@@ -86,9 +86,15 @@ def _query_connection(timeout_s: float) -> Iterator[sqlite3.Connection]:
     One per request, never shared. The authorizer and the progress handler belong
     to the connection: on a shared one, a request finishing cleared the timeout of
     another still running, and every query waited for the one ahead of it.
+
+    Double-quoted names are identifiers only, never strings. With SQLite's legacy
+    default, a quoted column that doesn't exist silently became a string literal,
+    and a query against a missing column "succeeded".
     """
     conn = _connect()
     try:
+        conn.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DML, False)
+        conn.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DDL, False)
         conn.set_authorizer(make_authorizer())
         start = time.monotonic()
 
@@ -149,7 +155,9 @@ def execute(request: ExecuteRequest) -> ExecuteResponse:
             cursor = conn.execute(rewritten)
             if cursor.description:
                 columns = [col[0] for col in cursor.description]
-                raw_rows = cursor.fetchall()
+                # The cap is enforced here, not by the guard: its LIMIT is skipped
+                # whenever the SQL has a LIMIT of its own, even in a subquery.
+                raw_rows = cursor.fetchmany(settings.row_limit)
                 rows = [list(r) for r in raw_rows]
             else:
                 columns = []

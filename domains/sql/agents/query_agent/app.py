@@ -35,4 +35,8 @@ def generate_sql(request: GenerateSqlRequest) -> GenerateSqlResponse:
         user="\n\n".join(user_parts),
         output_model=SqlOut,
     )
-    return GenerateSqlResponse(sql=result.parsed.sql)
+    out = result.parsed
+    if not out.answerable:
+        return GenerateSqlResponse(missing=out.missing.strip() or "no reason given")
+    # Passed on even when empty: the executor's guard rejects an empty query.
+    return GenerateSqlResponse(sql=out.sql)
