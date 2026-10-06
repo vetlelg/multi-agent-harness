@@ -1,0 +1,86 @@
+# Eval set v0 for the sql domain (milestone 5).
+#
+# Each case is a question and the result its answer must rest on. The live runner
+# (tests/test_evals_live.py) asks each one through /ask and scores the query evidence
+# with core.evals: column names, column order and extra columns don't matter; the rows
+# must match exactly, in order only when `ordered: true`, numbers at two decimals.
+# `unanswerable: true` means the data cannot answer: the run must end with `error` set.
+#
+# `reference` is how `rows` was derived. domains/sql/tests/test_evals.py runs it on
+# data/chinook.db, so an expected result can't drift from the data.
+
+cases:
+  - id: brazil-customers
+    question: How many customers are from Brazil?
+    reference: SELECT COUNT(*) FROM Customer WHERE Country = 'Brazil'
+    rows: [[5]]
+
+  - id: longest-track
+    question: What is the name of the longest track?
+    reference: SELECT Name FROM Track ORDER BY Milliseconds DESC LIMIT 1
+    rows: [["Occupation / Precipice"]]
+
+  - id: acdc-albums
+    question: How many albums does AC/DC have?
+    reference: >-
+      SELECT COUNT(*) FROM Album JOIN Artist ON Artist.ArtistId = Album.ArtistId
+      WHERE Artist.Name = 'AC/DC'
+    rows: [[2]]
+
+  - id: tracks-per-genre
+    question: How many tracks are there in each genre?
+    reference: >-
+      SELECT Genre.Name, COUNT(*) FROM Track JOIN Genre ON Genre.GenreId = Track.GenreId
+      GROUP BY Genre.GenreId
+    rows:
+      - ["Rock", 1297]
+      - ["Latin", 579]
+      - ["Metal", 374]
+      - ["Alternative & Punk", 332]
+      - ["Jazz", 130]
+      - ["TV Shows", 93]
+      - ["Blues", 81]
+      - ["Classical", 74]
+      - ["Drama", 64]
+      - ["R&B/Soul", 61]
+      - ["Reggae", 58]
+      - ["Pop", 48]
+      - ["Soundtrack", 43]
+      - ["Alternative", 40]
+      - ["Hip Hop/Rap", 35]
+      - ["Electronica/Dance", 30]
+      - ["Heavy Metal", 28]
+      - ["World", 28]
+      - ["Sci Fi & Fantasy", 26]
+      - ["Easy Listening", 24]
+      - ["Comedy", 17]
+      - ["Bossa Nova", 15]
+      - ["Science Fiction", 13]
+      - ["Rock And Roll", 12]
+      - ["Opera", 1]
+
+  - id: top-customer-country
+    question: Which country has the most customers?
+    reference: SELECT Country FROM Customer GROUP BY Country ORDER BY COUNT(*) DESC LIMIT 1
+    rows: [["USA"]]
+
+  - id: sales-2011
+    question: What were the total sales in 2011?
+    reference: SELECT SUM(Total) FROM Invoice WHERE strftime('%Y', InvoiceDate) = '2011'
+    rows: [[469.58]]
+
+  - id: top-artists-revenue
+    question: Who are the top 5 artists by total invoice revenue?
+    reference: >-
+      SELECT Artist.Name FROM InvoiceLine
+      JOIN Track ON Track.TrackId = InvoiceLine.TrackId
+      JOIN Album ON Album.AlbumId = Track.AlbumId
+      JOIN Artist ON Artist.ArtistId = Album.ArtistId
+      GROUP BY Artist.ArtistId
+      ORDER BY SUM(InvoiceLine.UnitPrice * InvoiceLine.Quantity) DESC LIMIT 5
+    ordered: true
+    rows: [["Iron Maiden"], ["U2"], ["Metallica"], ["Led Zeppelin"], ["Lost"]]
+
+  - id: customer-age
+    question: What is the average age of our customers?
+    unanswerable: true

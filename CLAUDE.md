@@ -77,6 +77,7 @@ domain means writing domain code, never editing the harness.**
 | `prompts.py` | `load_prompt` → `Prompt(id, text, sha)`; the id + sha land in every `ModelCall` |
 | `http.py` | Instrumented service calls (`get` / `post`) that emit `HttpCall` |
 | `service.py` | `create_app(service)`: FastAPI app with `/healthz`; the single hook for instrumentation |
+| `evals.py` | Eval sets (`EvalCase`/`EvalSet`), scoring against `/ask` evidence (`rows_match`, `score`), the pass-rate report (`EvalReport`, `render`) |
 
 ## The domain contract
 
@@ -93,7 +94,8 @@ domains/<name>/
   tools/<tool>/    # deterministic tool servers + guards (+ a Dockerfile when the tool needs
                    #   more than Python packages; the sql executor bakes in its database)
   tests/           # its unit tests (collected by the root pytest run)
-  evals/           # questions + expected answers, promptfoo config
+  evals/           # questions.yaml (cases + expected results), baseline.json (the
+                   #   recorded report); promptfoo config later
 infra/overlays/<name>/  # its deployment: compose.yaml + a kustomize overlay
                         #   (kustomization.yaml, one manifest per service)
 ```
@@ -106,6 +108,14 @@ and Secret `llm-credentials`. That Secret holds only the API keys; `make k8s-up`
 it from `.env`, so it is never in a manifest. Tool servers get none of the three. Images
 are imported, never pulled (`imagePullPolicy: Never`). Every pod must pass the
 `restricted` Pod Security Standard, which the base's Namespace enforces.
+
+**Evals** are scored by `core.evals` from the evidence `/ask` returns, never from the
+answer's wording. An answerable case's `query` evidence must hold its expected rows: column
+names, column order and extra columns are ignored; rows match exactly (ordered only when
+the case says `ordered: true`), numbers at two decimals. An `unanswerable` case must end
+with `error` set. Each case's `reference` (how its rows were derived) is checked against the
+data by a domain test. Run: `pytest -m live tests/test_evals_live.py [--eval-repeats N]`;
+it reports rates next to `baseline.json` and asserts none.
 
 **Adding a domain — acceptance criterion:** outside `domains/<name>/` and
 `infra/overlays/<name>/`, the only file that changes is `.env.example`. If anything else
@@ -269,7 +279,8 @@ orchestrator_scratch/       # engine.py (hand-built loop) + app.py
 orchestrator_lg/            # LangGraph compiler + app (milestone 9)
 domains/
   sql/                      # first domain (see "The domain contract")
-tests/                      # harness tests: engine, registry, agent loop, architecture rules
+tests/                      # harness tests: engine, registry, agent loop, architecture rules,
+                            #   eval scorer; test_evals_live.py is the live eval runner
 infra/
   base/docker/              # generic Dockerfiles: service (agents, plain tool servers), orchestrator (per engine)
   base/compose.yaml         # the engines, extended by every domain overlay
@@ -292,7 +303,7 @@ docs/                       # step instructions and explanations
    image started with `DOMAIN=sql`).
 4. ✅ k3d up, sql domain deployed via `infra/base` + `infra/overlays/sql`; CLI hits
    the in-cluster orchestrator (port-forward).
-5. Eval set v0 for sql: `domains/sql/evals/questions.yaml`, about 8 questions with
+5. ✅ Eval set v0 for sql: `domains/sql/evals/questions.yaml`, about 8 questions with
    expected result sets (include a join, an aggregation, and one the data cannot answer),
    scored by exact result-set match against the `query` evidence `/ask` returns. A `live`
    runner reports the pass rate per question and overall; record it as the baseline.
