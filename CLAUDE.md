@@ -23,7 +23,9 @@ domain means writing domain code, never editing the harness.**
   Knows nothing about any domain.
 - **Domain** — `domains/<name>/`: one use case, everything it needs, nothing shared with
   other domains.
-- **Agent** — a service whose job is a model call (e.g. `schema_agent`). Stateless.
+- **Agent** — a model role: a prompt, a model setting, and an output schema or tools,
+  called from a step through `core.llm.call_model` or `core.agent_loop.run_tool_loop`.
+  Runs in the orchestrator's process, not as a service (e.g. sql's schema agent).
 - **Tool server** — a deterministic service with data access or side effects and no LLM
   (e.g. the SQL `executor`). It enforces its guard in code.
 - **Pipeline** — a domain's steps, static edges, and conditional routes, declared as data
@@ -58,6 +60,11 @@ domain means writing domain code, never editing the harness.**
   through `core.http`. That is where events (and later OTel spans) are emitted.
 - Domains do not add event types. Tool activity is a `ToolCall` event with a namespaced
   tool name (`sql.execute`), so the log schema and dashboards are identical across domains.
+- Model calls run inside steps, in the orchestrator's process. A component gets its own
+  service only for a boundary: data access or side effects (tool servers, always),
+  credentials the orchestrator must not hold, a different owner or release cadence, or a
+  different runtime. Scaling is not a reason: a model call waits on the provider. In
+  process, every `ModelCall` lands in the orchestrator's ordered log of record.
 - Guards live in tool servers, in code. Never trust the model.
 - Every domain and both engines expose the identical `POST /ask` contract.
 - NEVER implement code automatically. Always let me (the human) implement it unless I
@@ -68,16 +75,16 @@ domain means writing domain code, never editing the harness.**
 | Module | Responsibility |
 |---|---|
 | `config.py` | `Settings` (harness), `DomainSettings` base, `ModelSpec` (`provider:model`) |
-| `models.py` | `Strict` base, `AgentRequest` (carries `run_id`), `/ask` contract, evidence kinds |
+| `models.py` | `Strict` base, `ServiceRequest` (carries `run_id`), `/ask` contract (`Outcome`), evidence kinds |
 | `events.py` | Typed event log, `emit`, `RunContext`, `sequenced` emitter (stamps `segment` + `seq`) |
 | `llm.py` | Provider adapters: structured output (`complete`), tool-use turns (`chat`); `call_model` emits `ModelCall` |
 | `agent_loop.py` | Hand-built tool loop for agentic domains: `Tool`, `ToolFailed`, `run_tool_loop` |
-| `pipeline.py` | `RunState` base, `Pipeline`, `Route`, `Domain`, `END`, `apply_update` |
+| `pipeline.py` | `RunState` base, `Pipeline`, `Route`, `Domain`, `END`, `UNANSWERABLE`, `apply_update`, `outcome` |
 | `registry.py` | `load_domain`, `load_domain_settings`, `available_domains` |
 | `prompts.py` | `load_prompt` → `Prompt(id, text, sha)`; the id + sha land in every `ModelCall` |
 | `http.py` | Instrumented service calls (`get` / `post`) that emit `HttpCall` |
 | `service.py` | `create_app(service)`: FastAPI app with `/healthz`; the single hook for instrumentation |
-| `evals.py` | Eval sets (`EvalCase`/`EvalSet`), scoring against `/ask` evidence (`rows_match`, `score`), the pass-rate report (`EvalReport`, `render`) |
+| `evals.py` | Eval sets (`EvalCase`/`EvalSet`), scoring against `/ask` outcome + evidence (`rows_match`, `score`), the answer-faithfulness judge, the pass-rate report (`EvalReport`, `render`) |
 
 ## The domain contract
 
@@ -85,17 +92,18 @@ A domain package contains:
 
 ```
 domains/<name>/
-  __init__.py      # empty: importing an agent must not pull in the pipeline
+  __init__.py      # empty: importing the config (the CLI) or a tool server must not pull in
+                   #   the pipeline; tool-server images have no provider SDK
   config.py        # <Name>Settings(DomainSettings), env_prefix "<NAME>_"; `settings`
   models.py        # its request/response contracts, model output schemas, its RunState subclass
   domain.py        # steps, routes, evidence(); exports DOMAIN = Domain(...)
   prompts/         # its prompt files
-  agents/<agent>/  # LLM services (FastAPI via create_app)
+  agents/<agent>/  # model roles, called from steps (a service only when a boundary needs one)
   tools/<tool>/    # deterministic tool servers + guards (+ a Dockerfile when the tool needs
                    #   more than Python packages; the sql executor bakes in its database)
   tests/           # its unit tests (collected by the root pytest run)
   evals/           # questions.yaml (cases + expected results), baseline.json (the
-                   #   recorded report); promptfoo config later
+                   #   recorded report)
 infra/overlays/<name>/  # its deployment: compose.yaml + a kustomize overlay
                         #   (kustomization.yaml, one manifest per service)
 ```
@@ -109,13 +117,16 @@ it from `.env`, so it is never in a manifest. Tool servers get none of the three
 are imported, never pulled (`imagePullPolicy: Never`). Every pod must pass the
 `restricted` Pod Security Standard, which the base's Namespace enforces.
 
-**Evals** are scored by `core.evals` from the evidence `/ask` returns, never from the
-answer's wording. An answerable case's `query` evidence must hold its expected rows: column
-names, column order and extra columns are ignored; rows match exactly (ordered only when
-the case says `ordered: true`), numbers at two decimals. An `unanswerable` case must end
-with `error` set. Each case's `reference` (how its rows were derived) is checked against the
-data by a domain test. Run: `pytest -m live tests/test_evals_live.py [--eval-repeats N]`;
-it reports rates next to `baseline.json` and asserts none.
+**Evals** are scored by `core.evals` from the `outcome` and evidence `/ask` returns, never
+from the answer's wording. An answerable case must end `answered`, and its `query` evidence
+must hold its expected rows: column names, column order and extra columns are ignored; rows
+match exactly (ordered only when the case says `ordered: true`), numbers at two decimals.
+An `unanswerable` case must end `unanswerable`; a run that `failed` is a failure, not a
+decline. Each case's `reference` (how its rows were derived) is checked against the data by
+a domain test. Separately, a judge model checks the answer's wording against its evidence
+(faithfulness) and reports its own rate. Run:
+`pytest -m live tests/test_evals_live.py [--eval-repeats N]`; it reports rates next to
+`baseline.json` and asserts none.
 
 **Adding a domain — acceptance criterion:** outside `domains/<name>/` and
 `infra/overlays/<name>/`, the only file that changes is `.env.example`. If anything else
@@ -133,8 +144,10 @@ had to change, the harness is missing an abstraction — fix the harness, not th
 
 ## Engines
 
-Shared semantics (both engines must hold these; tests in `tests/test_scratch_engine.py`
-pin them for scratch):
+Shared semantics: every engine must hold these. `tests/test_engine_conformance.py` pins
+them on the toy domain, running one set of tests against every engine. It pins "Run
+identity and resume" (below) too, for every engine with persistence; a step that dies on
+its first call stands in for a killed process.
 
 - A step is `(state, ctx) -> dict` of field updates, applied with
   `core.pipeline.apply_update`: updates overwrite fields and are re-validated; an unknown
@@ -148,6 +161,9 @@ pin them for scratch):
   ordered by `(segment, seq)`.
 - `max_steps` (domain settings) bounds the run; exceeding it is an error.
 - The pipeline must end with `state.answer` set.
+- The run's `outcome` comes from its final state, through `core.pipeline.outcome`: no
+  `error` → `answered`; `error_type` `unanswerable` (`core.pipeline.UNANSWERABLE`, the one
+  `error_type` value the harness reserves) → `unanswerable`; any other error → `failed`.
 
 ### Run identity and resume (both engines)
 
@@ -167,7 +183,9 @@ pin them for scratch):
   process is killed, in which case it simply stops. A segment without a `RunEnd` was
   interrupted.
 - The engine persists the new segment number with the run before executing anything in
-  it, so a segment that dies before its first checkpoint still uses up its number.
+  it, so a segment that dies before its first checkpoint still uses up its number. The
+  checkpoints can't supply it: a segment that died before checkpointing left none. The
+  counter is run bookkeeping, kept apart from the domain's run state.
 - A step may run more than once: resume re-runs the step that was interrupted. Steps must
   be safe to repeat (sql's are read-only).
 - An engine without persistence (scratch) has no record of any run, so every call is a
@@ -183,7 +201,13 @@ pin them for scratch):
 `RunState` subclass is the state schema, `max_steps` → recursion limit, `run_id` is the
 `thread_id`. Never invoke a used thread with new input: LangGraph starts again at the
 entry step on top of the old state (checked on 1.2.11 — `attempts` carried over). Resume
-is `invoke(None, config)`, which re-runs only the interrupted step. Persistent
+is `invoke(None, config)`, which re-runs only the interrupted step. The segment counter
+lives in its own table in the checkpointer's SQLite file (`runs(run_id, segment)`), read,
+incremented and committed before `invoke`. Never in graph state: writing state from outside
+a node means `update_state`, which LangGraph applies as if the last finished node had
+written it, by running that node's writers, its route included (checked on 1.2.11:
+`pregel/main.py`, `graph/state.py` `attach_branch`). That would re-run the route, log a
+second `RouteDecision`, and add a checkpoint. Persistent
 checkpointer: a SQLite file in dev; in-cluster that file lives on a PersistentVolumeClaim
 so resume survives pod restarts. That pins the Deployment to `replicas: 1` with
 `strategy: Recreate`: one writer per SQLite file, and a ReadWriteOnce volume can't be held
@@ -192,17 +216,20 @@ by an old and a new pod at once. (Postgres later lifts both.)
 ## `/ask` contract
 
 `POST /ask {question, run_id?}` →
-`{run_id, domain, orchestrator, question, answer, evidence[], attempts, error}`.
+`{run_id, domain, orchestrator, question, answer, evidence[], attempts, outcome, error}`.
 
 Evidence kinds: `query` (language, query, columns, rows — SQL, PromQL, …), `citation`
-(source, locator, excerpt), `tool` (tool, input, output, ok). `error` set with HTTP 200
-means "could not answer"; a 5xx means the service is broken. `run_id` is optional; what an
+(source, locator, excerpt), `tool` (tool, input, output, ok). `outcome` is `answered`,
+`unanswerable` (the data cannot answer: a correct decline) or `failed` (the run tried and
+could not produce a result, e.g. retries exhausted); `error` explains the last two. All
+three are HTTP 200; a 5xx means the service is broken. `RunEnd` carries the same `outcome`,
+so logs and dashboards count declines and failures apart. `run_id` is optional; what an
 engine does with a supplied one is set out under "Run identity and resume". A 409 means
 the `run_id` names an unfinished run with a different question.
 
 ## Behaviour requirements (every domain, both engines)
 
-- The `run_id` is on every inter-service call (`AgentRequest`) and in every event.
+- The `run_id` is on every inter-service call (`ServiceRequest`) and in every event.
 - Each service emits one JSON event per model call, tool call, and HTTP call to stdout
   (visible via `kubectl logs`). `ModelCall` carries prompt id + sha, system prompt, user
   prompt, response, params, tokens, timing. In dev the orchestrator also appends the whole
@@ -220,14 +247,16 @@ artists, albums, tracks, customers, invoices) by generating and executing SQL. `
 downloads it. The file is baked into the executor image (deliberate: small, read-only
 sample data — no seed jobs, no dialect drift between dev and cluster).
 
-- **schema_agent** (agent) — fetches the full schema from the executor's `/schema`, then
-  the model names the relevant tables. Code adds the tables on the shortest foreign-key
-  paths between them, takes every column, type and foreign key from the real schema (the
-  model never re-emits them), and lists the join conditions between them. An empty
-  selection means the data cannot answer.
-- **query_agent** (agent) — question + selected schema → one SQL statement, or a decline
-  saying what the schema lacks. On retry also receives the previous SQL and the error.
-- **executor** (tool server) — the only service with database access. No LLM.
+- **schema agent** (agent, in `get_schema`) — fetches the full schema from the executor's
+  `/schema`, then the model names the relevant tables. Code adds the tables on the shortest
+  foreign-key paths between them, takes every column, type and foreign key from the real
+  schema (the model never re-emits them), and lists the join conditions between them. An
+  empty selection means the data cannot answer.
+- **query agent** (agent, in `generate_sql`) — question + selected schema → one SQL
+  statement, or a decline saying what the schema lacks. On retry also receives the previous
+  SQL and the error.
+- **executor** (tool server) — the domain's only service, and the only component with
+  database access. No LLM.
   `GET /schema` (introspection) and `POST /execute` (guard → run → rows or classified
   error).
 - **Pipeline** — `get_schema → generate_sql → execute → (route) → answer`. After
@@ -245,8 +274,8 @@ sample data — no seed jobs, no dialect drift between dev and cluster).
 
 ## Stack
 
-- Python 3.12, venv + pip, pinned requirements (`requirements.txt` for agents and
-  orchestrators, `requirements-lg.txt` adds LangGraph, `requirements-tool.txt` is the
+- Python 3.12, venv + pip, pinned requirements (`requirements.txt` for orchestrators
+  and any model-calling service, `requirements-lg.txt` adds LangGraph, `requirements-tool.txt` is the
   minimal set for tool servers, `requirements-dev.txt` for tests)
 - LLM: provider-agnostic `core/llm.py`. Anthropic and Ollama adapters implemented, for
   both structured output and tool use; OpenAI/Gemini are a class each when wanted. Model
@@ -259,7 +288,7 @@ sample data — no seed jobs, no dialect drift between dev and cluster).
 - Docker, k3d 5.9 (k3s v1.35, pinned by digest), kustomize (built into kubectl):
   `infra/base/` (harness) + `infra/overlays/<domain>/`.
   One image per engine, containing `core/` and `domains/`; `DOMAIN` picks the domain at
-  startup. Agent and tool-server images carry `core/` plus their own domain only.
+  startup. Tool-server images carry `core/` plus their own domain only.
 - API keys: `.env` locally (gitignored); a Kubernetes Secret in-cluster (`llm-credentials`,
   made from `.env` by `make k8s-up`) — never in images or manifests
 - `pytest`, `ruff`. Tests that call a real model provider are marked `live` and excluded
@@ -271,7 +300,8 @@ sample data — no seed jobs, no dialect drift between dev and cluster).
   `create_app` / `core.http`; model-call spans use the GenAI semantic conventions
   (`gen_ai.*`) so dashboards work for every domain
 - Grafana stack in-cluster: Tempo (traces), Prometheus (metrics), Loki (logs), Grafana
-- `promptfoo` per domain for offline prompt evaluation; prompt id + sha in the run log tie
+- Answer faithfulness judged in `core.evals` by a judge model called through `core.llm`
+  (logged like any model call), for every domain; prompt id + sha in the run log tie
   results to prompt versions
 - Later: one Postgres for the LangGraph checkpointer and the event store (and pgvector,
   if the docs domain lands)
@@ -282,13 +312,14 @@ sample data — no seed jobs, no dialect drift between dev and cluster).
 cli.py                      # thin client: --domain, --target, --run-id
 core/                       # the harness library (see table above)
 orchestrator_scratch/       # engine.py (hand-built loop) + app.py
-orchestrator_lg/            # LangGraph compiler + app (milestone 9)
+orchestrator_lg/            # LangGraph compiler + app (milestone 10)
 domains/
   sql/                      # first domain (see "The domain contract")
-tests/                      # harness tests: engine, registry, agent loop, architecture rules,
-                            #   eval scorer; test_evals_live.py is the live eval runner
+tests/                      # harness tests: engine conformance, registry, agent loop,
+                            #   architecture rules, eval scorer; test_evals_live.py is the
+                            #   live eval runner
 infra/
-  base/docker/              # generic Dockerfiles: service (agents, plain tool servers), orchestrator (per engine)
+  base/docker/              # generic Dockerfiles: service (any service without its own), orchestrator (per engine)
   base/compose.yaml         # the engines, extended by every domain overlay
   base/k3d.yaml             # the local cluster, shared by every domain (make cluster)
   base/kustomization.yaml   # + namespace.yaml, orchestrator-scratch.yaml: the namespace policy
@@ -318,19 +349,33 @@ docs/                       # step instructions and explanations
 7. Error-retry verified end-to-end: force a failing query, confirm from the logs which
    route handled it (schema re-selection vs. query regeneration) and that the run
    recovered.
-8. Observability: OTel in `create_app` / `core.http` / `core.llm`, Grafana stack deployed
-   in-cluster, structlog replacing raw JSON prints. A cross-service trace for a full run
-   visible in Grafana.
-9. `orchestrator_lg` compiles any `Pipeline` and follows "Run identity and resume"; the
-   sql domain works end-to-end locally and passes the eval set on both engines.
-10. LangGraph orchestrator deployed alongside scratch. Resume verified: kill the pod
+8. `/ask` reports an `outcome` (`answered` / `unanswerable` / `failed`), derived by
+   `core.pipeline.outcome` and carried on `RunEnd`; the eval scorer passes an unanswerable
+   case only on `unanswerable` (the v0 baseline counted a run that failed on
+   `no such function: JULIANDIFF` as a decline). sql baseline re-recorded.
+9. Model calls run in steps: the sql schema and query agents become code called from
+   `get_schema` and `generate_sql`, and their services, images and manifests go; the
+   executor is the sql domain's only service. `AgentRequest` becomes `ServiceRequest`.
+   Every `ModelCall` is in the orchestrator's ordered log. The eval pass rate holds against
+   the milestone-8 baseline.
+10. Engine conformance, then `orchestrator_lg`. First `tests/test_scratch_engine.py`
+    becomes `tests/test_engine_conformance.py`, parametrized over engines, with the resume
+    rules added for engines with persistence. Then `orchestrator_lg` compiles any
+    `Pipeline`, passes the suite, and follows "Run identity and resume"; the sql domain
+    works end-to-end locally and passes the eval set on both engines.
+11. LangGraph orchestrator deployed alongside scratch. Resume verified: kill the pod
     mid-run and rerun with the same `run_id`. The run continues from the checkpoint; the
     log shows segment 1 without a `RunEnd` and segment 2 ending in one; a third call with
     the same `run_id` returns the stored result.
-11. Eval set grown to 20 questions; `pytest -m live` runs it against both in-cluster
+12. Observability: OTel in `create_app` / `core.http` / `core.llm`, Grafana stack deployed
+    in-cluster, structlog replacing raw JSON prints. A cross-service trace for a full run
+    visible in Grafana on both engines, and a resumed run's segments found together.
+13. Eval set grown to 20 questions; `pytest -m live` runs it against both in-cluster
     orchestrators via `/ask` and reports pass rates.
-12. `promptfoo` per domain: LLM-as-judge where needed (exact result-set match for sql),
-    baseline snapshot, diff report on prompt changes.
+14. Answer faithfulness: `core.evals` gains a judge, a model call through `core.llm` that
+    checks the answer's wording against its evidence (every number, name and count it
+    states, and any claim about truncation). It is reported as a second rate next to
+    result match, per case and overall, for every domain, and recorded in the baseline.
 
 ## Deliberately deferred (do not build yet)
 
